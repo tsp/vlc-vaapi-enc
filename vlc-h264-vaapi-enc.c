@@ -54,7 +54,6 @@ struct encoder_sys_t
 {
 	VADisplay va_dpy;
 	VASurfaceID surface_id[SURFACE_NUM];
-	VABufferID coded_buf[CODEDBUF_NUM];
 	VAContextID context_id;
 	VAConfigID config_id;
 	Display *x11_display;
@@ -149,6 +148,14 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
  *****************************************************************************/
 static void CloseEncoder( vlc_object_t *p_this )
 {
-	VLC_UNUSED(p_this);
+	encoder_t *p_enc = (encoder_t *)p_this;
+	encoder_sys_t *p_sys = p_enc->p_sys;
+
+	vaDestroySurfaces(p_sys->va_dpy, &(p_sys->surface_id[0]),SURFACE_NUM);
+	vaDestroyContext(p_sys->va_dpy, p_sys->context_id);
+	vaDestroyConfig(p_sys->va_dpy, p_sys->config_id);
+	vaTerminate(p_sys->va_dpy);
+	XCloseDisplay(p_sys->x11_display);
+	free(p_sys);
 }
 
