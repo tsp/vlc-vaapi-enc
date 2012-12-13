@@ -48,15 +48,23 @@ vlc_module_end ()
  *****************************************************************************/
 static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict );
 
-#define SURFACE_NUM 18
-#define CODEDBUF_NUM 5
+#define SID_NUMBER                              3
+#define SID_INPUT_PICTURE                       0
+#define SID_REFERENCE_PICTURE                   1
+#define SID_RECON_PICTURE                       2
 struct encoder_sys_t
 {
 	VADisplay va_dpy;
-	VASurfaceID surface_id[SURFACE_NUM];
 	VAContextID context_id;
 	VAConfigID config_id;
 	Display *x11_display;
+
+	VASurfaceID surface_id[SID_NUMBER];
+	VABufferID seq_parameter;
+	VABufferID pic_parameter;
+	VABufferID slice_parameter;
+	VABufferID coded_buf;
+	int codedbuf_size;
 };
 
 /*****************************************************************************
@@ -69,6 +77,7 @@ static int OpenEncoder( vlc_object_t *p_this )
 	VAConfigAttrib attrib[2];
 	int major_ver, minor_ver;
 	int num_entrypoints, slice_entrypoint;
+	VAEncSequenceParameterBufferH264 seq_h264;
 
 	encoder_t *p_enc = (encoder_t *)p_this;
 	encoder_sys_t *p_sys;
@@ -84,7 +93,7 @@ static int OpenEncoder( vlc_object_t *p_this )
 
 	p_enc->pf_encode_video = EncodeVideo;
 	p_enc->pf_encode_audio = NULL;
-	p_enc->fmt_in.i_codec = VLC_CODEC_I420;
+	p_enc->fmt_in.i_codec = VLC_CODEC_NV12;
 
 	p_sys->x11_display = XOpenDisplay(getenv("DISPLAY"));
 	p_sys->va_dpy = vaGetDisplay(p_sys->x11_display);
@@ -125,11 +134,33 @@ static int OpenEncoder( vlc_object_t *p_this )
 	va_status = vaCreateConfig(p_sys->va_dpy, VAProfileH264Baseline, VAEntrypointEncSlice, &attrib[0], 2, &(p_sys->config_id));
 	//CHECK_VASTATUS(va_status, "vaCreateConfig");
 
-	va_status = vaCreateSurfaces(p_sys->va_dpy, p_enc->fmt_in.video.i_width, p_enc->fmt_in.video.i_height, VA_RT_FORMAT_YUV420, SURFACE_NUM, &(p_sys->surface_id[0]));
+	va_status = vaCreateContext(p_sys->va_dpy, p_sys->config_id, p_enc->fmt_in.video.i_width, p_enc->fmt_in.video.i_height, VA_PROGRESSIVE, 0, 0, &(p_sys->context_id));
+	//CHECK_VASTATUS(va_status, "vaCreateContext");
+
+
+
+	p_sys->seq_parameter = VA_INVALID_ID;
+	p_sys->pic_parameter = VA_INVALID_ID;
+	p_sys->slice_parameter = VA_INVALID_ID;
+
+	memset(&seq_h264, 0, sizeof(seq_h264));
+	seq_h264.level_idc = 30;
+	seq_h264.picture_width_in_mbs = (p_enc->fmt_in.video.i_width+15)/16;
+	seq_h264.picture_height_in_mbs = (p_enc->fmt_in.video.i_height+15)/16;
+
+	seq_h264.bits_per_second = 1500*1000; //TODO: Make configurable, currently fixed to 1500 kbps
+	seq_h264.initial_qp = 26; //TODO: Make configurable
+	seq_h264.min_qp = 3; //TODO: ...
+
+	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncSequenceParameterBufferType, sizeof(seq_h264), 1, &seq_h264, &(p_sys->seq_parameter));
+	//CHECK_VASTATUS(va_status,"vaCreateBuffer");
+	
+	va_status = vaCreateSurfaces(p_sys->va_dpy, p_enc->fmt_in.video.i_width, p_enc->fmt_in.video.i_height, VA_RT_FORMAT_YUV420, SID_NUMBER, &(p_sys->surface_id[0]));
 	//CHECK_VASTATUS(va_status, "vaCreateSurfaces");
 
-	va_status = vaCreateContext(p_sys->va_dpy, p_sys->config_id, p_enc->fmt_in.video.i_width, ((p_enc->fmt_in.video.i_height+15)/16)*16, VA_PROGRESSIVE, &(p_sys->surface_id[0]), SURFACE_NUM, &(p_sys->context_id));
-	//CHECK_VASTATUS(va_status, "vaCreateContext");
+	p_sys->codedbuf_size =  p_enc->fmt_in.video.i_width * p_enc->fmt_in.video.i_height * 1.5;
+	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncCodedBufferType, p_sys->codedbuf_size, 1, NULL, &(p_sys->coded_buf));
+	//CHECK_VASTATUS(va_status,"vaCreateBuffer");
 
 	return VLC_SUCCESS;
 }
@@ -139,7 +170,6 @@ static int OpenEncoder( vlc_object_t *p_this )
  ****************************************************************************/
 static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 {
-	VLC_UNUSED(p_enc); VLC_UNUSED(p_pict);
 	return NULL;
 }
 
@@ -151,7 +181,9 @@ static void CloseEncoder( vlc_object_t *p_this )
 	encoder_t *p_enc = (encoder_t *)p_this;
 	encoder_sys_t *p_sys = p_enc->p_sys;
 
-	vaDestroySurfaces(p_sys->va_dpy, &(p_sys->surface_id[0]),SURFACE_NUM);
+	vaDestroyBuffer(p_sys->va_dpy, p_sys->coded_buf);
+	vaDestroySurfaces(p_sys->va_dpy, &(p_sys->surface_id[0]), SID_NUMBER);
+	vaDestroyBuffer(p_sys->va_dpy, p_sys->seq_parameter);
 	vaDestroyContext(p_sys->va_dpy, p_sys->context_id);
 	vaDestroyConfig(p_sys->va_dpy, p_sys->config_id);
 	vaTerminate(p_sys->va_dpy);
