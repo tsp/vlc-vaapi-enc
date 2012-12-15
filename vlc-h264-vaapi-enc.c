@@ -65,6 +65,9 @@ struct encoder_sys_t
 	VABufferID slice_parameter;
 	VABufferID coded_buf;
 	int codedbuf_size;
+	
+	VAEncPictureParameterBufferH264 pic_h264;
+    VAEncSliceParameterBuffer slice_h264;
 };
 
 /*****************************************************************************
@@ -91,6 +94,9 @@ static int OpenEncoder( vlc_object_t *p_this )
 	if(!p_sys)
 		return VLC_ENOMEM;
 
+	memset(&(p_sys->pic_h264), 0, sizeof(p_sys->pic_h264));
+	memset(&(p_sys->slice_h264), 0, sizeof(p_sys->slice_h264));
+		
 	p_enc->pf_encode_video = EncodeVideo;
 	p_enc->pf_encode_audio = NULL;
 	p_enc->fmt_in.i_codec = VLC_CODEC_NV12;
@@ -131,7 +137,7 @@ static int OpenEncoder( vlc_object_t *p_this )
 	attrib[0].value = VA_RT_FORMAT_YUV420;
 	attrib[1].value = VA_RC_VBR;
 
-	va_status = vaCreateConfig(p_sys->va_dpy, VAProfileH264Baseline, VAEntrypointEncSlice, &attrib[0], 2, &(p_sys->config_id));
+	va_status = vaCreateConfig(p_sys->va_dpy, VAProfileH264Main, VAEntrypointEncSlice, &attrib[0], 2, &(p_sys->config_id));
 	//CHECK_VASTATUS(va_status, "vaCreateConfig");
 
 	va_status = vaCreateContext(p_sys->va_dpy, p_sys->config_id, p_enc->fmt_in.video.i_width, p_enc->fmt_in.video.i_height, VA_PROGRESSIVE, 0, 0, &(p_sys->context_id));
@@ -148,6 +154,8 @@ static int OpenEncoder( vlc_object_t *p_this )
 	seq_h264.picture_width_in_mbs = (p_enc->fmt_in.video.i_width+15)/16;
 	seq_h264.picture_height_in_mbs = (p_enc->fmt_in.video.i_height+15)/16;
 
+	seq_h264.intra_idr_period = 30;
+	seq_h264.frame_rate = p_enc->fmt_in.video.i_frame_rate; //TODO: Make configurable
 	seq_h264.bits_per_second = 1500*1000; //TODO: Make configurable, currently fixed to 1500 kbps
 	seq_h264.initial_qp = 26; //TODO: Make configurable
 	seq_h264.min_qp = 3; //TODO: ...
@@ -170,6 +178,62 @@ static int OpenEncoder( vlc_object_t *p_this )
  ****************************************************************************/
 static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 {
+	encoder_sys_t *p_sys = p_enc->p_sys;
+	VAStatus va_status;
+	VACodedBufferSegment *coded_buffer_segment = NULL;
+	unsigned char *coded_mem;
+	VABufferID tempID;
+	
+	va_status = vaBeginPicture(p_sys->va_dpy, p_sys->context_id, p_sys->surface_id[SID_INPUT_PICTURE]);
+	//CHECK_VASTATUS(va_status, "vaBeginPicture");
+
+	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->seq_parameter), 1);
+    //CHECK_VASTATUS(va_status, "vaRenderPicture");
+	
+	//TODO: The Magic, Uploading YUV to libva
+	
+	p_sys->pic_h264.reference_picture = p_sys->surface_id[SID_REFERENCE_PICTURE];
+    p_sys->pic_h264.reconstructed_picture = p_sys->surface_id[SID_RECON_PICTURE];
+    p_sys->pic_h264.coded_buf = p_sys->coded_buf;
+    p_sys->pic_h264.picture_width = p_enc->fmt_in.video.i_width;
+    p_sys->pic_h264.picture_height = p_enc->fmt_in.video.i_height;
+    p_sys->pic_h264.last_picture = 0;
+	if(p_sys->pic_parameter != VA_INVALID_ID)
+		vaDestroyBuffer(p_sys->va_dpy, p_sys->pic_parameter);
+
+	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncPictureParameterBufferType, sizeof(p_sys->pic_h264), 1, &(p_sys->pic_h264), &(p_sys->pic_parameter));
+	//CHECK_VASTATUS(va_status,"vaCreateBuffer");
+	
+	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->pic_parameter), 1);
+    //CHECK_VASTATUS(va_status,"vaRenderPicture");
+
+	va_status = vaMapBuffer(p_sys->va_dpy, p_sys->coded_buf, (void **)(&coded_buffer_segment));
+    //CHECK_VASTATUS(va_status,"vaMapBuffer");
+    coded_mem = coded_buffer_segment->buf;
+    memset(coded_mem, 0, coded_buffer_segment->size);
+    vaUnmapBuffer(p_sys->va_dpy, p_sys->coded_buf);
+	
+	p_sys->slice_h264.start_row_number = 0;
+    p_sys->slice_h264.slice_height = (p_enc->fmt_in.video.i_height + 15)/16;
+    //p_sys->slice_h264.slice_flags.bits.is_intra = intra_slice; //TODO: Find out about the intra/idr frame handling
+    p_sys->slice_h264.slice_flags.bits.disable_deblocking_filter_idc = 0;
+	if(p_sys->slice_parameter != VA_INVALID_ID)
+		vaDestroyBuffer(p_sys->va_dpy, p_sys->slice_parameter);
+	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncSliceParameterBufferType, sizeof(p_sys->slice_h264), 1, &(p_sys->slice_h264), &(p_sys->slice_parameter));
+	//CHECK_VASTATUS(va_status,"vaCreateBuffer");
+	
+	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->slice_parameter), 1);
+	//CHECK_VASTATUS(va_status,"vaRenderPicture");
+	
+	tempID = p_sys->surface_id[SID_RECON_PICTURE];
+	p_sys->surface_id[SID_RECON_PICTURE] = p_sys->surface_id[SID_REFERENCE_PICTURE]; 
+	p_sys->surface_id[SID_REFERENCE_PICTURE] = tempID;
+	
+	va_status = vaEndPicture(p_sys->va_dpy, p_sys->context_id);
+	//CHECK_VASTATUS(va_status,"vaRenderPicture");
+	
+	//TODO: Somehow get the rendered image into a format VLC understands and return it.
+	
 	return NULL;
 }
 
