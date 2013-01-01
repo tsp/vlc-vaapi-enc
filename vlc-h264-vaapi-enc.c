@@ -66,7 +66,7 @@ struct encoder_sys_t
 	VABufferID slice_parameter;
 	VABufferID coded_buf;
 	int codedbuf_size;
-	
+
 	VAEncPictureParameterBufferH264 pic_h264;
     VAEncSliceParameterBuffer slice_h264;
 };
@@ -88,7 +88,7 @@ static int OpenEncoder( vlc_object_t *p_this )
 
 	if(p_enc->fmt_out.i_codec != VLC_CODEC_H264 && !p_enc->b_force)
 		return VLC_EGENERIC;
-	
+
 	p_enc->fmt_out.i_cat = VIDEO_ES;
 	p_enc->fmt_out.i_codec = VLC_CODEC_H264;
 	p_enc->p_sys = p_sys = malloc(sizeof(encoder_sys_t));
@@ -97,10 +97,10 @@ static int OpenEncoder( vlc_object_t *p_this )
 
 	memset(&(p_sys->pic_h264), 0, sizeof(p_sys->pic_h264));
 	memset(&(p_sys->slice_h264), 0, sizeof(p_sys->slice_h264));
-		
+
 	p_enc->pf_encode_video = EncodeVideo;
 	p_enc->pf_encode_audio = 0;
-	p_enc->fmt_in.i_codec = VLC_CODEC_NV12;
+	p_enc->fmt_in.i_codec = VLC_CODEC_I420;
 
 	p_sys->x11_display = XOpenDisplay(0);
 	if(!p_sys->x11_display)
@@ -108,7 +108,7 @@ static int OpenEncoder( vlc_object_t *p_this )
 		msg_Err(p_enc, "Could not connect to X");
 		return VLC_EGENERIC;
 	}
-	
+
 	p_sys->va_dpy = vaGetDisplay(p_sys->x11_display);
 	if(!p_sys->va_dpy)
 	{
@@ -116,7 +116,7 @@ static int OpenEncoder( vlc_object_t *p_this )
 		XCloseDisplay(p_sys->x11_display);
 		return VLC_EGENERIC;
 	}
-	
+
 	va_status = vaInitialize(p_sys->va_dpy, &major_ver, &minor_ver);
 	CHECK_VASTATUS(va_status, "vaInitialize", VLC_EGENERIC);
 
@@ -125,7 +125,7 @@ static int OpenEncoder( vlc_object_t *p_this )
 	for(slice_entrypoint = 0; slice_entrypoint < num_entrypoints; slice_entrypoint++)
 		if(entrypoints[slice_entrypoint] == VAEntrypointEncSlice)
 			break;
-	
+
 	if(slice_entrypoint == num_entrypoints)
 	{
 		vaTerminate(p_sys->va_dpy);
@@ -180,7 +180,7 @@ static int OpenEncoder( vlc_object_t *p_this )
 
 	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncSequenceParameterBufferType, sizeof(seq_h264), 1, &seq_h264, &(p_sys->seq_parameter));
 	CHECK_VASTATUS(va_status,"vaCreateBuffer", VLC_EGENERIC);
-	
+
 	va_status = vaCreateSurfaces(p_sys->va_dpy, p_enc->fmt_in.video.i_width, p_enc->fmt_in.video.i_height, VA_RT_FORMAT_YUV420, SID_NUMBER, &(p_sys->surface_id[0]));
 	CHECK_VASTATUS(va_status, "vaCreateSurfaces", VLC_EGENERIC);
 
@@ -194,6 +194,44 @@ static int OpenEncoder( vlc_object_t *p_this )
 /****************************************************************************
  * EncodeVideo: the whole thing
  ****************************************************************************/
+void CopyPlane(uint8_t *dst, size_t dst_pitch, const uint8_t *src, size_t src_pitch, uint32_t width, uint32_t height)
+{
+	for(uint32_t y = 0; y < height; y++)
+	{
+		memcpy(dst, src, width);
+		src += src_pitch;
+		dst += dst_pitch;
+	}
+}
+
+void CopyToYv12(picture_t *src, uint8_t *dst[3], size_t dst_pitch[3], uint32_t width, uint32_t height)
+{
+	CopyPlane(dst[0], dst_pitch[0], src->p[0].p_pixels, src->p[0].i_pitch, width, height);
+	CopyPlane(dst[1], dst_pitch[1], src->p[1].p_pixels, src->p[1].i_pitch, width/2, height/2);
+	CopyPlane(dst[2], dst_pitch[2], src->p[2].p_pixels, src->p[2].i_pitch, width/2, height/2);
+}
+
+void RevSplitPlanes(const uint8_t *srcu, size_t srcu_pitch, uint8_t *srcv, size_t srcv_pitch, uint8_t *dst, size_t dst_pitch, uint32_t width, uint32_t height)
+{
+	for(uint32_t y = 0; y < height; y++)
+	{
+		for(uint32_t x = 0; x < width; x++)
+		{
+			dst[2*x+0] = srcu[x];
+			dst[2*x+1] = srcv[x];
+		}
+		dst += dst_pitch;
+		srcu += srcu_pitch;
+		srcv += srcv_pitch;
+	}
+}
+
+void CopyToNv12(picture_t *src, uint8_t *dst[2], size_t dst_pitch[2], uint32_t width, uint32_t height)
+{
+	CopyPlane(dst[0], dst_pitch[0], src->p[0].p_pixels, src->p[0].i_pitch, width, height);
+	RevSplitPlanes(src->p[2].p_pixels, src->p[2].i_pitch, src->p[1].p_pixels, src->p[1].i_pitch, dst[1], dst_pitch[1], width/2, height/2);
+}
+
 static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 {
 	encoder_sys_t *p_sys = p_enc->p_sys;
@@ -201,15 +239,64 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 	VACodedBufferSegment *coded_buffer_segment = NULL;
 	unsigned char *coded_mem;
 	VABufferID tempID;
-	
+
 	va_status = vaBeginPicture(p_sys->va_dpy, p_sys->context_id, p_sys->surface_id[SID_INPUT_PICTURE]);
 	CHECK_VASTATUS(va_status, "vaBeginPicture", 0);
 
 	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->seq_parameter), 1);
     CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
-	
-	//TODO: The Magic, Uploading YUV to libva
-	
+
+
+	VAImage surface_image;
+	va_status = vaDeriveImage(p_sys->va_dpy, p_sys->surface_id[SID_INPUT_PICTURE], &surface_image);
+	CHECK_VASTATUS(va_status, "vaDeriveImage", 0);
+
+	void *surface_p = 0;
+	va_status = vaMapBuffer(p_sys->va_dpy, surface_image.buf, &surface_p);
+	CHECK_VASTATUS(va_status, "vaMapBuffer", 0);
+
+	if(surface_image.format.fourcc == VA_FOURCC('Y','V','1','2')
+		|| surface_image.format.fourcc == VA_FOURCC('I','4','2','0'))
+	{
+		bool b_swap_uv = (surface_image.format.fourcc == VA_FOURCC('I','4','2','0'));
+		uint8_t *pp_plane[3];
+		size_t  pi_pitch[3];
+
+		for(int i = 0; i < 3; i++)
+		{
+			int i_plane = (b_swap_uv && i != 0) ?  (3 - i) : i;
+			pp_plane[i] = (uint8_t*)surface_p + surface_image.offsets[i_plane];
+			pi_pitch[i] = surface_image.pitches[i_plane];
+		}
+
+		CopyToYv12(p_pict, pp_plane, pi_pitch, p_enc->fmt_in.video.i_width, p_enc->fmt_in.video.i_height);
+	}
+	else if(surface_image.format.fourcc == VA_FOURCC('N','V','1','2'))
+	{
+		uint8_t *pp_plane[2];
+		size_t pi_pitch[2];
+		
+		for(int i = 0; i < 2; i++)
+		{
+			pp_plane[i] = (uint8_t*)surface_p + surface_image.offsets[i];
+			pi_pitch[i] = surface_image.pitches[i];
+		}
+		
+		CopyToNv12(p_pict, pp_plane, pi_pitch, p_enc->fmt_in.video.i_width, p_enc->fmt_in.video.i_height);
+	}
+	else
+	{
+		msg_Err(p_enc, "Unsupported Image Format!");
+		vaUnmapBuffer(p_sys->va_dpy, surface_image.buf);
+		vaDestroyImage(p_sys->va_dpy, surface_image.image_id);
+		vaEndPicture(p_sys->va_dpy, p_sys->context_id);
+		return 0;
+	}
+
+	vaUnmapBuffer(p_sys->va_dpy, surface_image.buf);
+	vaDestroyImage(p_sys->va_dpy, surface_image.image_id);
+
+
 	p_sys->pic_h264.reference_picture = p_sys->surface_id[SID_REFERENCE_PICTURE];
     p_sys->pic_h264.reconstructed_picture = p_sys->surface_id[SID_RECON_PICTURE];
     p_sys->pic_h264.coded_buf = p_sys->coded_buf;
@@ -221,7 +308,7 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 
 	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncPictureParameterBufferType, sizeof(p_sys->pic_h264), 1, &(p_sys->pic_h264), &(p_sys->pic_parameter));
 	CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
-	
+
 	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->pic_parameter), 1);
     CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
 
@@ -230,7 +317,7 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
     coded_mem = coded_buffer_segment->buf;
     memset(coded_mem, 0, coded_buffer_segment->size);
     vaUnmapBuffer(p_sys->va_dpy, p_sys->coded_buf);
-	
+
 	p_sys->slice_h264.start_row_number = 0;
     p_sys->slice_h264.slice_height = (p_enc->fmt_in.video.i_height + 15)/16;
     //p_sys->slice_h264.slice_flags.bits.is_intra = intra_slice; //TODO: Find out about the intra/idr frame handling
@@ -239,19 +326,19 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 		vaDestroyBuffer(p_sys->va_dpy, p_sys->slice_parameter);
 	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncSliceParameterBufferType, sizeof(p_sys->slice_h264), 1, &(p_sys->slice_h264), &(p_sys->slice_parameter));
 	CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
-	
+
 	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->slice_parameter), 1);
 	CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
-	
+
 	tempID = p_sys->surface_id[SID_RECON_PICTURE];
-	p_sys->surface_id[SID_RECON_PICTURE] = p_sys->surface_id[SID_REFERENCE_PICTURE]; 
+	p_sys->surface_id[SID_RECON_PICTURE] = p_sys->surface_id[SID_REFERENCE_PICTURE];
 	p_sys->surface_id[SID_REFERENCE_PICTURE] = tempID;
-	
+
 	va_status = vaEndPicture(p_sys->va_dpy, p_sys->context_id);
 	CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
-	
+
 	//TODO: Somehow get the rendered image into a format VLC understands and return it.
-	
+
 	return 0;
 }
 
