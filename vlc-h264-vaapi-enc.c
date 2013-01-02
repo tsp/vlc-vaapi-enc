@@ -69,6 +69,9 @@ struct encoder_sys_t
 
 	VAEncPictureParameterBufferH264 pic_h264;
     VAEncSliceParameterBuffer slice_h264;
+	
+	uint32_t intra_counter;
+	uint32_t intra_rate;
 };
 
 /*****************************************************************************
@@ -172,7 +175,8 @@ static int OpenEncoder( vlc_object_t *p_this )
 	seq_h264.picture_width_in_mbs = (p_enc->fmt_in.video.i_width+15)/16;
 	seq_h264.picture_height_in_mbs = (p_enc->fmt_in.video.i_height+15)/16;
 
-	seq_h264.intra_idr_period = 30;
+	p_sys->intra_rate = 30;
+	seq_h264.intra_idr_period = p_sys->intra_rate;
 	seq_h264.frame_rate = p_enc->fmt_in.video.i_frame_rate; //TODO: Make configurable
 	seq_h264.bits_per_second = 1500*1000; //TODO: Make configurable, currently fixed to 1500 kbps
 	seq_h264.initial_qp = 26; //TODO: Make configurable
@@ -188,6 +192,8 @@ static int OpenEncoder( vlc_object_t *p_this )
 	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncCodedBufferType, p_sys->codedbuf_size, 1, NULL, &(p_sys->coded_buf));
 	CHECK_VASTATUS(va_status,"vaCreateBuffer", VLC_EGENERIC);
 
+	p_sys->intra_counter = 0;
+	
 	return VLC_SUCCESS;
 }
 
@@ -232,28 +238,17 @@ void CopyToNv12(picture_t *src, uint8_t *dst[2], size_t dst_pitch[2], uint32_t w
 	RevSplitPlanes(src->p[2].p_pixels, src->p[2].i_pitch, src->p[1].p_pixels, src->p[1].i_pitch, dst[1], dst_pitch[1], width/2, height/2);
 }
 
-static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
+bool UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID surface_id)
 {
 	encoder_sys_t *p_sys = p_enc->p_sys;
-	VAStatus va_status;
-	VACodedBufferSegment *coded_buffer_segment = NULL;
-	unsigned char *coded_mem;
-	VABufferID tempID;
-
-	va_status = vaBeginPicture(p_sys->va_dpy, p_sys->context_id, p_sys->surface_id[SID_INPUT_PICTURE]);
-	CHECK_VASTATUS(va_status, "vaBeginPicture", 0);
-
-	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->seq_parameter), 1);
-    CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
-
 
 	VAImage surface_image;
-	va_status = vaDeriveImage(p_sys->va_dpy, p_sys->surface_id[SID_INPUT_PICTURE], &surface_image);
-	CHECK_VASTATUS(va_status, "vaDeriveImage", 0);
+	VAStatus va_status = vaDeriveImage(p_sys->va_dpy, surface_id, &surface_image);
+	CHECK_VASTATUS(va_status, "vaDeriveImage", false);
 
 	void *surface_p = 0;
 	va_status = vaMapBuffer(p_sys->va_dpy, surface_image.buf, &surface_p);
-	CHECK_VASTATUS(va_status, "vaMapBuffer", 0);
+	CHECK_VASTATUS(va_status, "vaMapBuffer", false);
 
 	if(surface_image.format.fourcc == VA_FOURCC('Y','V','1','2')
 		|| surface_image.format.fourcc == VA_FOURCC('I','4','2','0'))
@@ -275,13 +270,13 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 	{
 		uint8_t *pp_plane[2];
 		size_t pi_pitch[2];
-		
+
 		for(int i = 0; i < 2; i++)
 		{
 			pp_plane[i] = (uint8_t*)surface_p + surface_image.offsets[i];
 			pi_pitch[i] = surface_image.pitches[i];
 		}
-		
+
 		CopyToNv12(p_pict, pp_plane, pi_pitch, p_enc->fmt_in.video.i_width, p_enc->fmt_in.video.i_height);
 	}
 	else
@@ -289,13 +284,62 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 		msg_Err(p_enc, "Unsupported Image Format!");
 		vaUnmapBuffer(p_sys->va_dpy, surface_image.buf);
 		vaDestroyImage(p_sys->va_dpy, surface_image.image_id);
-		vaEndPicture(p_sys->va_dpy, p_sys->context_id);
-		return 0;
+		return false;
 	}
 
 	vaUnmapBuffer(p_sys->va_dpy, surface_image.buf);
 	vaDestroyImage(p_sys->va_dpy, surface_image.image_id);
 
+	return true;
+}
+
+block_t *GenCodedBlock(encoder_t *p_enc)
+{
+	encoder_sys_t *p_sys = p_enc->p_sys;
+	
+	VACodedBufferSegment *buf_list = 0;
+	VAStatus va_status;
+	
+	va_status = vaMapBuffer(p_sys->va_dpy, p_sys->coded_buf, (void**)(&buf_list));
+	CHECK_VASTATUS(va_status, "vaMapBuffer", 0);
+
+	block_t *block = 0;
+	block_t *chain = 0;
+	
+	while(buf_list != 0)
+	{
+		block = block_Alloc(buf_list->size);
+		block_ChainAppend(&chain, block);
+		
+		memcpy(block->p_buffer, buf_list->buf, buf_list->size);
+		
+		buf_list = (VACodedBufferSegment*)buf_list->next;
+	}
+	
+	vaUnmapBuffer(p_sys->va_dpy, p_sys->coded_buf);
+	
+	return chain;
+}
+
+static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
+{
+	encoder_sys_t *p_sys = p_enc->p_sys;
+	VAStatus va_status;
+	VACodedBufferSegment *coded_buffer_segment = NULL;
+	unsigned char *coded_mem;
+	VABufferID tempID;
+
+	va_status = vaBeginPicture(p_sys->va_dpy, p_sys->context_id, p_sys->surface_id[SID_INPUT_PICTURE]);
+	CHECK_VASTATUS(va_status, "vaBeginPicture", 0);
+
+	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->seq_parameter), 1);
+    CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
+
+	if(!UploadPictureToSurface(p_enc, p_pict, p_sys->surface_id[SID_INPUT_PICTURE]))
+	{
+		msg_Err(p_enc, "Error uploading Image");
+		return 0;
+	}
 
 	p_sys->pic_h264.reference_picture = p_sys->surface_id[SID_REFERENCE_PICTURE];
     p_sys->pic_h264.reconstructed_picture = p_sys->surface_id[SID_RECON_PICTURE];
@@ -320,10 +364,11 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 
 	p_sys->slice_h264.start_row_number = 0;
     p_sys->slice_h264.slice_height = (p_enc->fmt_in.video.i_height + 15)/16;
-    //p_sys->slice_h264.slice_flags.bits.is_intra = intra_slice; //TODO: Find out about the intra/idr frame handling
+    p_sys->slice_h264.slice_flags.bits.is_intra = (p_sys->intra_counter == 0); //TODO: Find out about the intra/idr frame handling
     p_sys->slice_h264.slice_flags.bits.disable_deblocking_filter_idc = 0;
 	if(p_sys->slice_parameter != VA_INVALID_ID)
 		vaDestroyBuffer(p_sys->va_dpy, p_sys->slice_parameter);
+
 	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncSliceParameterBufferType, sizeof(p_sys->slice_h264), 1, &(p_sys->slice_h264), &(p_sys->slice_parameter));
 	CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
 
@@ -339,7 +384,11 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 
 	//TODO: Somehow get the rendered image into a format VLC understands and return it.
 
-	return 0;
+	p_sys->intra_counter += 1;
+	if(p_sys->intra_counter >= p_sys->intra_rate)
+		p_sys->intra_counter = 0;
+	
+	return GenCodedBlock(p_enc);
 }
 
 /*****************************************************************************
