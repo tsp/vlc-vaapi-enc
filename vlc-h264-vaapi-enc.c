@@ -35,9 +35,9 @@ static int OpenEncoder( vlc_object_t * );
 static void CloseEncoder( vlc_object_t * );
 
 vlc_module_begin ()
-	set_shortname( "h264-vaapi-enc" )
-	set_description( "h264 encoder using vaapi for hardware accelerated endocing" )
-	set_capability( "encoder", 0 )
+	set_shortname( "h264-vaapi" )
+	set_description( "H264 VAAPI encoder" )
+	set_capability( "encoder", 10 )
 	set_callbacks( OpenEncoder, CloseEncoder )
 	add_shortcut( "h264-vaapi" )
 vlc_module_end ()
@@ -245,10 +245,12 @@ bool UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID sur
 	VAImage surface_image;
 	VAStatus va_status = vaDeriveImage(p_sys->va_dpy, surface_id, &surface_image);
 	CHECK_VASTATUS(va_status, "vaDeriveImage", false);
+	msg_Dbg(p_enc, "Derived Image");
 
 	void *surface_p = 0;
 	va_status = vaMapBuffer(p_sys->va_dpy, surface_image.buf, &surface_p);
 	CHECK_VASTATUS(va_status, "vaMapBuffer", false);
+	msg_Dbg(p_enc, "Mapped Buffer");
 
 	if(surface_image.format.fourcc == VA_FOURCC('Y','V','1','2')
 		|| surface_image.format.fourcc == VA_FOURCC('I','4','2','0'))
@@ -289,6 +291,7 @@ bool UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID sur
 
 	vaUnmapBuffer(p_sys->va_dpy, surface_image.buf);
 	vaDestroyImage(p_sys->va_dpy, surface_image.image_id);
+	msg_Dbg(p_enc, "Done Copying Data");
 
 	return true;
 }
@@ -302,6 +305,7 @@ block_t *GenCodedBlock(encoder_t *p_enc)
 	
 	va_status = vaMapBuffer(p_sys->va_dpy, p_sys->coded_buf, (void**)(&buf_list));
 	CHECK_VASTATUS(va_status, "vaMapBuffer", 0);
+	msg_Dbg(p_enc, "Mapped output buffer");
 
 	block_t *block = 0;
 	block_t *chain = 0;
@@ -312,11 +316,13 @@ block_t *GenCodedBlock(encoder_t *p_enc)
 		block_ChainAppend(&chain, block);
 		
 		memcpy(block->p_buffer, buf_list->buf, buf_list->size);
+		msg_Dbg(p_enc, "Added Block with size %d to chain", buf_list->size);
 		
 		buf_list = (VACodedBufferSegment*)buf_list->next;
 	}
 	
 	vaUnmapBuffer(p_sys->va_dpy, p_sys->coded_buf);
+	msg_Dbg(p_enc, "Done Writing output");
 	
 	return chain;
 }
@@ -331,9 +337,11 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 
 	va_status = vaBeginPicture(p_sys->va_dpy, p_sys->context_id, p_sys->surface_id[SID_INPUT_PICTURE]);
 	CHECK_VASTATUS(va_status, "vaBeginPicture", 0);
+	msg_Dbg(p_enc, "Beginning Picture");
 
 	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->seq_parameter), 1);
     CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
+	msg_Dbg(p_enc, "Init Rendering Picture");
 
 	if(!UploadPictureToSurface(p_enc, p_pict, p_sys->surface_id[SID_INPUT_PICTURE]))
 	{
@@ -352,15 +360,20 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 
 	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncPictureParameterBufferType, sizeof(p_sys->pic_h264), 1, &(p_sys->pic_h264), &(p_sys->pic_parameter));
 	CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
+	
+	msg_Dbg(p_enc, "Created Enc Buffer");
 
 	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->pic_parameter), 1);
     CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
+	
+	msg_Dbg(p_enc, "Rendered Picture");
 
 	va_status = vaMapBuffer(p_sys->va_dpy, p_sys->coded_buf, (void **)(&coded_buffer_segment));
     CHECK_VASTATUS(va_status, "vaMapBuffer", 0);
     coded_mem = coded_buffer_segment->buf;
     memset(coded_mem, 0, coded_buffer_segment->size);
     vaUnmapBuffer(p_sys->va_dpy, p_sys->coded_buf);
+	msg_Dbg(p_enc, "Cleared Coded Mem");
 
 	p_sys->slice_h264.start_row_number = 0;
     p_sys->slice_h264.slice_height = (p_enc->fmt_in.video.i_height + 15)/16;
@@ -371,9 +384,13 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 
 	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncSliceParameterBufferType, sizeof(p_sys->slice_h264), 1, &(p_sys->slice_h264), &(p_sys->slice_parameter));
 	CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
+	
+	msg_Dbg(p_enc, "Created enc buffer 2");
 
 	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->slice_parameter), 1);
 	CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
+	
+	msg_Dbg(p_enc, "Rendered Picture again");
 
 	tempID = p_sys->surface_id[SID_RECON_PICTURE];
 	p_sys->surface_id[SID_RECON_PICTURE] = p_sys->surface_id[SID_REFERENCE_PICTURE];
@@ -382,7 +399,7 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 	va_status = vaEndPicture(p_sys->va_dpy, p_sys->context_id);
 	CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
 
-	//TODO: Somehow get the rendered image into a format VLC understands and return it.
+	msg_Dbg(p_enc, "Done");
 
 	p_sys->intra_counter += 1;
 	if(p_sys->intra_counter >= p_sys->intra_rate)
