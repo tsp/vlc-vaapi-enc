@@ -482,7 +482,6 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
 		block_ChainAppend(&chain, block);
 
 		memcpy(block->p_buffer, buf_list->buf, buf_list->size);
-		msg_Dbg(p_enc, "Added Block with size %d to chain", buf_list->size);
 
 		buf_list = (VACodedBufferSegment*)buf_list->next;
 	}
@@ -492,7 +491,6 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
 	chain->i_flags = (is_intra?BLOCK_FLAG_TYPE_I:BLOCK_FLAG_TYPE_P);
 
 	vaUnmapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id);
-	msg_Dbg(p_enc, "Done Writing output");
 
 	return chain;
 }
