@@ -26,10 +26,39 @@
 #include <vlc_codec.h>
 #include <vlc_charset.h>
 #include <vlc_cpu.h>
+#include <assert.h>
 #include <math.h>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #include <va/va.h>
 #include <va/va_x11.h>
+#include <va/va_drm.h>
+#include <va/va_enc_h264.h>
+
+#define NAL_REF_IDC_NONE        0
+#define NAL_REF_IDC_LOW         1
+#define NAL_REF_IDC_MEDIUM      2
+#define NAL_REF_IDC_HIGH        3
+
+#define NAL_NON_IDR             1
+#define NAL_IDR                 5
+#define NAL_SPS                 7
+#define NAL_PPS                 8
+#define NAL_SEI			        6
+
+#define SLICE_TYPE_P            0
+#define SLICE_TYPE_B            1
+#define SLICE_TYPE_I            2
+
+#define ENTROPY_MODE_CAVLC      0
+#define ENTROPY_MODE_CABAC      1
+
+#define PROFILE_IDC_BASELINE    66
+#define PROFILE_IDC_MAIN        77
+#define PROFILE_IDC_HIGH        100
 
 static int OpenEncoder( vlc_object_t * );
 static void CloseEncoder( vlc_object_t * );
@@ -37,9 +66,9 @@ static void CloseEncoder( vlc_object_t * );
 vlc_module_begin ()
 	set_shortname( "h264-vaapi" )
 	set_description( "H264 VAAPI encoder" )
-	set_capability( "encoder", 10 )
+	set_capability( "encoder", 0 )
 	set_callbacks( OpenEncoder, CloseEncoder )
-	add_shortcut( "h264-vaapi" )
+	add_shortcut( "vaapi", "va" )
 vlc_module_end ()
 
 #define CHECK_VASTATUS(s,t,e) {if((s)!=VA_STATUS_SUCCESS){msg_Err(p_enc, "vaapi: CHECK_STATUS for %s failed with code %d", t, s); return e;}}
@@ -49,29 +78,60 @@ vlc_module_end ()
  *****************************************************************************/
 static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict );
 
-#define SID_NUMBER                              3
-#define SID_INPUT_PICTURE                       0
-#define SID_REFERENCE_PICTURE                   1
-#define SID_RECON_PICTURE                       2
+#define MAX_SLICES                32
+#define SID_INPUT_PICTURE_0                     0
+#define SID_INPUT_PICTURE_1                     1
+#define SID_REFERENCE_PICTURE_L0                2
+#define SID_REFERENCE_PICTURE_L1                3
+#define SID_RECON_PICTURE                       4
+#define SID_NUMBER                              SID_RECON_PICTURE + 1
 struct encoder_sys_t
 {
 	VADisplay va_dpy;
-	VAContextID context_id;
-	VAConfigID config_id;
 	Display *x11_display;
+	int drm_fd;
 
-	VASurfaceID surface_id[SID_NUMBER];
-	VABufferID seq_parameter;
-	VABufferID pic_parameter;
-	VABufferID slice_parameter;
-	VABufferID coded_buf;
-	int codedbuf_size;
+    int picture_width;
+    int picture_height;
+    int picture_width_in_mbs;
+    int picture_height_in_mbs;
+	int qp_value;
+	int frame_bit_rate;
 
-	VAEncPictureParameterBufferH264 pic_h264;
-    VAEncSliceParameterBuffer slice_h264;
-	
 	uint32_t intra_counter;
 	uint32_t intra_rate;
+	uint32_t first_frame;
+
+	VASurfaceID surface_id[SID_NUMBER];
+	VAProfile profile;
+	int constraint_set_flag;
+	VAEncSequenceParameterBufferH264 seq_param;
+	VAEncPictureParameterBufferH264 pic_param;
+	VAEncSliceParameterBufferH264 slice_param[MAX_SLICES];
+	VAContextID context_id;
+	VAConfigID config_id;
+	VABufferID seq_param_buf_id;
+	VABufferID pic_param_buf_id;
+	VABufferID slice_param_buf_id[MAX_SLICES];  /* Slice level parameter, multil slices */
+	VABufferID codedbuf_buf_id;                 /* Output buffer, compressed data */
+	VABufferID packed_seq_header_param_buf_id;
+	VABufferID packed_seq_buf_id;
+	VABufferID packed_pic_header_param_buf_id;
+	VABufferID packed_pic_buf_id;
+	VABufferID packed_sei_header_param_buf_id;   /* the SEI buffer */
+	VABufferID packed_sei_buf_id;
+	VABufferID misc_parameter_hrd_buf_id;
+
+	int num_slices;
+	int codedbuf_i_size;
+	int codedbuf_pb_size;
+	int current_input_surface;
+	int rate_control_method;
+	int i_initial_cpb_removal_delay;
+	int i_initial_cpb_removal_delay_length;
+	int i_cpb_removal_delay;
+	int i_cpb_removal_delay_length;
+	int i_dpb_output_delay_length;
 };
 
 /*****************************************************************************
@@ -84,159 +144,304 @@ static int OpenEncoder( vlc_object_t *p_this )
 	VAConfigAttrib attrib[2];
 	int major_ver, minor_ver;
 	int num_entrypoints, slice_entrypoint;
-	VAEncSequenceParameterBufferH264 seq_h264;
+	VAImage test_image;
+	int i;
 
 	encoder_t *p_enc = (encoder_t *)p_this;
 	encoder_sys_t *p_sys;
+
+	p_enc->pf_encode_video = EncodeVideo;
+	p_enc->pf_encode_audio = 0;
 
 	if(p_enc->fmt_out.i_codec != VLC_CODEC_H264 && !p_enc->b_force)
 		return VLC_EGENERIC;
 
 	p_enc->fmt_out.i_cat = VIDEO_ES;
 	p_enc->fmt_out.i_codec = VLC_CODEC_H264;
-	p_enc->p_sys = p_sys = malloc(sizeof(encoder_sys_t));
+	p_enc->p_sys = p_sys = calloc(1, sizeof(encoder_sys_t));
 	if(!p_sys)
 		return VLC_ENOMEM;
 
-	memset(&(p_sys->pic_h264), 0, sizeof(p_sys->pic_h264));
-	memset(&(p_sys->slice_h264), 0, sizeof(p_sys->slice_h264));
+	{ ///START INITIALIZE VARIABLES
+		p_sys->picture_width = p_enc->fmt_in.video.i_width;
+		p_sys->picture_height = p_enc->fmt_in.video.i_height;
+		p_sys->picture_width_in_mbs = (p_sys->picture_width + 15) / 16;
+		p_sys->picture_height_in_mbs = (p_sys->picture_height + 15) / 16;
+		p_sys->qp_value = 28;
+		p_sys->frame_bit_rate = 0;
+		p_sys->intra_rate = 30;
+		p_sys->intra_counter = 0;
+		p_sys->first_frame = 1;
 
-	p_enc->pf_encode_video = EncodeVideo;
-	p_enc->pf_encode_audio = 0;
-	p_enc->fmt_in.i_codec = VLC_CODEC_I420;
+		p_sys->profile = VAProfileH264High;
 
-	p_sys->x11_display = XOpenDisplay(0);
-	if(!p_sys->x11_display)
-	{
-		msg_Err(p_enc, "Could not connect to X");
-		return VLC_EGENERIC;
-	}
+		switch (p_sys->profile)
+		{
+			case VAProfileH264Baseline:
+				p_sys->constraint_set_flag |= (1 << 0); /* Annex A.2.1 */
+				break;
+			case VAProfileH264Main:
+				p_sys->constraint_set_flag |= (1 << 1); /* Annex A.2.2 */
+				break;
+			case VAProfileH264High:
+				p_sys->constraint_set_flag |= (1 << 3); /* Annex A.2.4 */
+				break;
+			default:
+				break;
+		}
 
-	p_sys->va_dpy = vaGetDisplay(p_sys->x11_display);
-	if(!p_sys->va_dpy)
-	{
-		msg_Err(p_enc, "Could not get a VAAPI device");
-		XCloseDisplay(p_sys->x11_display);
-		return VLC_EGENERIC;
-	}
+		p_sys->seq_param_buf_id = VA_INVALID_ID;
+		p_sys->pic_param_buf_id = VA_INVALID_ID;
+		p_sys->packed_seq_header_param_buf_id = VA_INVALID_ID;
+		p_sys->packed_seq_buf_id = VA_INVALID_ID;
+		p_sys->packed_pic_header_param_buf_id = VA_INVALID_ID;
+		p_sys->packed_pic_buf_id = VA_INVALID_ID;
+		p_sys->codedbuf_buf_id = VA_INVALID_ID;
+		p_sys->misc_parameter_hrd_buf_id = VA_INVALID_ID;
+		p_sys->codedbuf_i_size = p_sys->picture_width * p_sys->picture_height;
+		p_sys->codedbuf_pb_size = 0;
+		p_sys->current_input_surface = SID_INPUT_PICTURE_0;
+		p_sys->packed_sei_header_param_buf_id = VA_INVALID_ID;
+		p_sys->packed_sei_buf_id = VA_INVALID_ID;
 
-	va_status = vaInitialize(p_sys->va_dpy, &major_ver, &minor_ver);
-	CHECK_VASTATUS(va_status, "vaInitialize", VLC_EGENERIC);
+		if(p_sys->qp_value == -1)
+		{
+			p_sys->rate_control_method = VA_RC_CBR;
+		}
+		else if(p_sys->qp_value == -2)
+		{
+			p_sys->rate_control_method = VA_RC_VBR;
+		}
+		else
+		{
+			assert(p_sys->qp_value >= 0 && p_sys->qp_value <= 51);
+			p_sys->rate_control_method = VA_RC_CQP;
+		}
 
-	vaQueryConfigEntrypoints(p_sys->va_dpy, VAProfileH264High, entrypoints, &num_entrypoints);
+		for (i = 0; i < MAX_SLICES; i++)
+		{
+			p_sys->slice_param_buf_id[i] = VA_INVALID_ID;
+		}
 
-	for(slice_entrypoint = 0; slice_entrypoint < num_entrypoints; slice_entrypoint++)
-		if(entrypoints[slice_entrypoint] == VAEntrypointEncSlice)
-			break;
+		{ // Initialize seq_param
+			int frame_cropping_flag = 0;
+			int frame_crop_bottom_offset = 0;
 
-	if(slice_entrypoint == num_entrypoints)
-	{
-		vaTerminate(p_sys->va_dpy);
-		XCloseDisplay(p_sys->x11_display);
-		msg_Err(p_enc, "System does not have h264 encoding support");
-		return VLC_EGENERIC;
-	}
+			p_sys->seq_param.seq_parameter_set_id = 0;
+			p_sys->seq_param.level_idc = 41;
+			p_sys->seq_param.intra_period = p_sys->intra_rate;
+			p_sys->seq_param.ip_period = 0;   /* FIXME: ??? */
+			p_sys->seq_param.max_num_ref_frames = 4;
+			p_sys->seq_param.picture_width_in_mbs = p_sys->picture_width_in_mbs;
+			p_sys->seq_param.picture_height_in_mbs = p_sys->picture_height_in_mbs;
+			p_sys->seq_param.seq_fields.bits.frame_mbs_only_flag = 1;
 
-	attrib[0].type = VAConfigAttribRTFormat;
-	attrib[1].type = VAConfigAttribRateControl;
-	vaGetConfigAttributes(p_sys->va_dpy, VAProfileH264High, VAEntrypointEncSlice, &attrib[0], 2);
+			if(p_sys->frame_bit_rate > 0)
+				p_sys->seq_param.bits_per_second = 1024 * p_sys->frame_bit_rate;
+			else
+				p_sys->seq_param.bits_per_second = 0;
 
-	if((attrib[0].value & VA_RT_FORMAT_YUV420) == 0)
-	{
-		vaTerminate(p_sys->va_dpy);
-		XCloseDisplay(p_sys->x11_display);
-		msg_Err(p_enc, "No YUV420 Format!");
-		return VLC_EGENERIC;
-	}
+			p_sys->seq_param.time_scale = 900;
+			p_sys->seq_param.num_units_in_tick = 15;
 
-	if((attrib[1].value & VA_RC_VBR) == 0)
-	{
-		vaTerminate(p_sys->va_dpy);
-		XCloseDisplay(p_sys->x11_display);
-		msg_Err(p_enc, "No VBR RC!");
-		return VLC_EGENERIC;
-	}
+			if(p_sys->picture_height_in_mbs * 16 - p_sys->picture_height)
+			{
+				frame_cropping_flag = 1;
+				frame_crop_bottom_offset =
+					(p_sys->picture_height_in_mbs * 16 - p_sys->picture_height) / (2 * (!p_sys->seq_param.seq_fields.bits.frame_mbs_only_flag + 1));
+			}
 
-	attrib[0].value = VA_RT_FORMAT_YUV420;
-	attrib[1].value = VA_RC_VBR;
+			p_sys->seq_param.frame_cropping_flag = frame_cropping_flag;
+			p_sys->seq_param.frame_crop_left_offset = 0;
+			p_sys->seq_param.frame_crop_right_offset = 0;
+			p_sys->seq_param.frame_crop_top_offset = 0;
+			p_sys->seq_param.frame_crop_bottom_offset = frame_crop_bottom_offset;
 
-	va_status = vaCreateConfig(p_sys->va_dpy, VAProfileH264Main, VAEntrypointEncSlice, &attrib[0], 2, &(p_sys->config_id));
-	CHECK_VASTATUS(va_status, "vaCreateConfig", VLC_EGENERIC);
+			p_sys->seq_param.seq_fields.bits.pic_order_cnt_type = 0;
+			p_sys->seq_param.seq_fields.bits.direct_8x8_inference_flag = 0;
 
-	va_status = vaCreateContext(p_sys->va_dpy, p_sys->config_id, p_enc->fmt_in.video.i_width, p_enc->fmt_in.video.i_height, VA_PROGRESSIVE, 0, 0, &(p_sys->context_id));
-	CHECK_VASTATUS(va_status, "vaCreateContext", VLC_EGENERIC);
+			p_sys->seq_param.seq_fields.bits.log2_max_frame_num_minus4 = 0;
+			p_sys->seq_param.seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 = 2;
 
-	p_sys->seq_parameter = VA_INVALID_ID;
-	p_sys->pic_parameter = VA_INVALID_ID;
-	p_sys->slice_parameter = VA_INVALID_ID;
+			if(p_sys->frame_bit_rate > 0)
+				p_sys->seq_param.vui_parameters_present_flag = 1;
+			else
+				p_sys->seq_param.vui_parameters_present_flag = 0;
+		}
 
-	memset(&seq_h264, 0, sizeof(seq_h264));
-	seq_h264.level_idc = 30;
-	seq_h264.picture_width_in_mbs = (p_enc->fmt_in.video.i_width+15)/16;
-	seq_h264.picture_height_in_mbs = (p_enc->fmt_in.video.i_height+15)/16;
+		{ // Initialize pic_param
+			p_sys->pic_param.seq_parameter_set_id = 0;
+			p_sys->pic_param.pic_parameter_set_id = 0;
 
-	p_sys->intra_rate = 30;
-	seq_h264.intra_idr_period = p_sys->intra_rate;
-	seq_h264.frame_rate = p_enc->fmt_in.video.i_frame_rate; //TODO: Make configurable
-	seq_h264.bits_per_second = 1500*1000; //TODO: Make configurable, currently fixed to 1500 kbps
-	seq_h264.initial_qp = 26; //TODO: Make configurable
-	seq_h264.min_qp = 3; //TODO: ...
+			p_sys->pic_param.last_picture = 0;
+			p_sys->pic_param.frame_num = 0;
 
-	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncSequenceParameterBufferType, sizeof(seq_h264), 1, &seq_h264, &(p_sys->seq_parameter));
-	CHECK_VASTATUS(va_status,"vaCreateBuffer", VLC_EGENERIC);
+			p_sys->pic_param.pic_init_qp = (p_sys->qp_value >= 0 ?  p_sys->qp_value : 26);
+			p_sys->pic_param.num_ref_idx_l0_active_minus1 = 0;
+			p_sys->pic_param.num_ref_idx_l1_active_minus1 = 0;
 
-	va_status = vaCreateSurfaces(p_sys->va_dpy, p_enc->fmt_in.video.i_width, p_enc->fmt_in.video.i_height, VA_RT_FORMAT_YUV420, SID_NUMBER, &(p_sys->surface_id[0]));
-	CHECK_VASTATUS(va_status, "vaCreateSurfaces", VLC_EGENERIC);
+			p_sys->pic_param.pic_fields.bits.idr_pic_flag = 0;
+			p_sys->pic_param.pic_fields.bits.reference_pic_flag = 0;
+			p_sys->pic_param.pic_fields.bits.entropy_coding_mode_flag = ENTROPY_MODE_CABAC;
+			p_sys->pic_param.pic_fields.bits.weighted_pred_flag = 0;
+			p_sys->pic_param.pic_fields.bits.weighted_bipred_idc = 0;
 
-	p_sys->codedbuf_size =  p_enc->fmt_in.video.i_width * p_enc->fmt_in.video.i_height * 1.5;
-	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncCodedBufferType, p_sys->codedbuf_size, 1, NULL, &(p_sys->coded_buf));
-	CHECK_VASTATUS(va_status,"vaCreateBuffer", VLC_EGENERIC);
+			if(p_sys->constraint_set_flag & 0x7)
+				p_sys->pic_param.pic_fields.bits.transform_8x8_mode_flag = 0;
+			else
+				p_sys->pic_param.pic_fields.bits.transform_8x8_mode_flag = 1;
 
-	p_sys->intra_counter = 0;
-	
+			p_sys->pic_param.pic_fields.bits.deblocking_filter_control_present_flag = 1;
+		}
+
+		if(p_sys->rate_control_method == VA_RC_CBR)
+		{ // Initialize sei
+			int target_bit_rate = p_sys->seq_param.bits_per_second;
+			int init_cpb_size = (target_bit_rate * 8) >> 10;
+			p_sys->i_initial_cpb_removal_delay = init_cpb_size * 0.5 * 1024 / target_bit_rate * 90000;
+
+			p_sys->i_cpb_removal_delay = 2;
+			p_sys->i_initial_cpb_removal_delay_length = 24;
+			p_sys->i_cpb_removal_delay_length = 24;
+			p_sys->i_dpb_output_delay_length = 24;
+		}
+	} ///DONE INITIALIZE VARIABLES
+
+	{ ///START OPEN DISPLAY
+		p_sys->x11_display = XOpenDisplay(0);
+		if(!p_sys->x11_display)
+		{
+			p_sys->drm_fd = open("/dev/dri/card0", O_RDWR);
+			if(p_sys->drm_fd < 0)
+			{
+				msg_Err(p_enc, "Could not open XDisplay and DRM device!");
+				free(p_sys);
+				return VLC_EGENERIC;
+			}
+		}
+		else
+		{
+			p_sys->drm_fd = -1;
+		}
+
+		if(p_sys->x11_display)
+		{
+			msg_Info(p_enc, "Using X11 VA Display");
+			p_sys->va_dpy = vaGetDisplay(p_sys->x11_display);
+		}
+		else if(p_sys->drm_fd >= 0)
+		{
+			msg_Info(p_enc, "Using DRM VA Display");
+			p_sys->va_dpy = vaGetDisplayDRM(p_sys->drm_fd);
+		}
+		else assert(0);
+
+		if(!p_sys->va_dpy)
+		{
+			msg_Err(p_enc, "Could not get a VAAPI device");
+			if(p_sys->x11_display)
+				XCloseDisplay(p_sys->x11_display);
+			if(p_sys->drm_fd >= 0)
+				close(p_sys->drm_fd);
+			free(p_sys);
+			return VLC_EGENERIC;
+		}
+	} ///DONE OPEN DISPLAY
+
+	{ /// START CREATE PIPE
+		va_status = vaInitialize(p_sys->va_dpy, &major_ver, &minor_ver);
+		CHECK_VASTATUS(va_status, "vaInitialize", VLC_EGENERIC);
+
+		vaQueryConfigEntrypoints(p_sys->va_dpy, p_sys->profile, entrypoints, &num_entrypoints);
+
+		for(slice_entrypoint = 0; slice_entrypoint < num_entrypoints; slice_entrypoint++)
+			if(entrypoints[slice_entrypoint] == VAEntrypointEncSlice)
+				break;
+
+		if(slice_entrypoint == num_entrypoints)
+		{
+			vaTerminate(p_sys->va_dpy);
+			if(p_sys->x11_display)
+				XCloseDisplay(p_sys->x11_display);
+			if(p_sys->drm_fd >= 0)
+				close(p_sys->drm_fd);
+			free(p_sys);
+			msg_Err(p_enc, "System does not have h264 encoding support");
+			return VLC_EGENERIC;
+		}
+
+		attrib[0].type = VAConfigAttribRTFormat;
+		attrib[1].type = VAConfigAttribRateControl;
+		vaGetConfigAttributes(p_sys->va_dpy, p_sys->profile, VAEntrypointEncSlice, &attrib[0], 2);
+
+		if((attrib[0].value & VA_RT_FORMAT_YUV420) == 0 || (attrib[1].value & p_sys->rate_control_method) == 0)
+		{
+			vaTerminate(p_sys->va_dpy);
+			if(p_sys->x11_display)
+				XCloseDisplay(p_sys->x11_display);
+			if(p_sys->drm_fd >= 0)
+				close(p_sys->drm_fd);
+			free(p_sys);
+			msg_Err(p_enc, "No YUV420 Format or no desired RC!");
+			return VLC_EGENERIC;
+		}
+
+		attrib[0].value = VA_RT_FORMAT_YUV420;
+		attrib[1].value = p_sys->rate_control_method;
+
+		va_status = vaCreateConfig(p_sys->va_dpy, p_sys->profile, VAEntrypointEncSlice, &attrib[0], 2, &(p_sys->config_id));
+		CHECK_VASTATUS(va_status, "vaCreateConfig", VLC_EGENERIC);
+
+		va_status = vaCreateContext(p_sys->va_dpy, p_sys->config_id, p_sys->picture_width, p_sys->picture_height, VA_PROGRESSIVE, 0, 0, &(p_sys->context_id));
+		CHECK_VASTATUS(va_status, "vaCreateContext", VLC_EGENERIC);
+	} /// DONE CREATING PIPE
+
+	{ /// START ALLOC RESOURCES
+		va_status = vaCreateSurfaces(
+			p_sys->va_dpy,
+			VA_RT_FORMAT_YUV420, p_sys->picture_width, p_sys->picture_height,
+			&(p_sys->surface_id[0]), SID_NUMBER,
+			NULL, 0
+		);
+		CHECK_VASTATUS(va_status, "vaCreateSurfaces", VLC_EGENERIC);
+	} /// DONE ALLOC RESOURCES
+
+	{ /// START PROBE IMAGE FORMAT
+		va_status = vaDeriveImage(p_sys->va_dpy, p_sys->surface_id[SID_INPUT_PICTURE_0], &test_image);
+		CHECK_VASTATUS(va_status, "vaDeriveImage", false);
+
+		p_enc->fmt_in.i_codec = test_image.format.fourcc;
+
+		va_status = vaDestroyImage(p_sys->va_dpy, test_image.image_id);
+		CHECK_VASTATUS(va_status, "vaDestroyImage", false);
+	} /// DONE PROBE IMAGE FORMAT
+
 	return VLC_SUCCESS;
+}
+
+/*****************************************************************************
+ * CloseDecoder: decoder destruction
+ *****************************************************************************/
+
+static void CloseEncoder( vlc_object_t *p_this )
+{
+	encoder_t *p_enc = (encoder_t *)p_this;
+	encoder_sys_t *p_sys = p_enc->p_sys;
+
+	vaDestroySurfaces(p_sys->va_dpy, &(p_sys->surface_id[0]), SID_NUMBER);
+	vaDestroyContext(p_sys->va_dpy, p_sys->context_id);
+	vaDestroyConfig(p_sys->va_dpy, p_sys->config_id);
+	vaTerminate(p_sys->va_dpy);
+	if(p_sys->x11_display)
+		XCloseDisplay(p_sys->x11_display);
+	if(p_sys->drm_fd >= 0)
+		close(p_sys->drm_fd);
+	free(p_sys);
 }
 
 /****************************************************************************
  * EncodeVideo: the whole thing
  ****************************************************************************/
-void CopyPlane(uint8_t *dst, size_t dst_pitch, const uint8_t *src, size_t src_pitch, uint32_t width, uint32_t height)
-{
-	for(uint32_t y = 0; y < height; y++)
-	{
-		memcpy(dst, src, width);
-		src += src_pitch;
-		dst += dst_pitch;
-	}
-}
-
-void CopyToYv12(picture_t *src, uint8_t *dst[3], size_t dst_pitch[3], uint32_t width, uint32_t height)
-{
-	CopyPlane(dst[0], dst_pitch[0], src->p[0].p_pixels, src->p[0].i_pitch, width, height);
-	CopyPlane(dst[1], dst_pitch[1], src->p[1].p_pixels, src->p[1].i_pitch, width/2, height/2);
-	CopyPlane(dst[2], dst_pitch[2], src->p[2].p_pixels, src->p[2].i_pitch, width/2, height/2);
-}
-
-void RevSplitPlanes(const uint8_t *srcu, size_t srcu_pitch, uint8_t *srcv, size_t srcv_pitch, uint8_t *dst, size_t dst_pitch, uint32_t width, uint32_t height)
-{
-	for(uint32_t y = 0; y < height; y++)
-	{
-		for(uint32_t x = 0; x < width; x++)
-		{
-			dst[2*x+0] = srcu[x];
-			dst[2*x+1] = srcv[x];
-		}
-		dst += dst_pitch;
-		srcu += srcu_pitch;
-		srcv += srcv_pitch;
-	}
-}
-
-void CopyToNv12(picture_t *src, uint8_t *dst[2], size_t dst_pitch[2], uint32_t width, uint32_t height)
-{
-	CopyPlane(dst[0], dst_pitch[0], src->p[0].p_pixels, src->p[0].i_pitch, width, height);
-	RevSplitPlanes(src->p[2].p_pixels, src->p[2].i_pitch, src->p[1].p_pixels, src->p[1].i_pitch, dst[1], dst_pitch[1], width/2, height/2);
-}
 
 bool UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID surface_id)
 {
@@ -266,7 +471,7 @@ bool UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID sur
 			pi_pitch[i] = surface_image.pitches[i_plane];
 		}
 
-		CopyToYv12(p_pict, pp_plane, pi_pitch, p_enc->fmt_in.video.i_width, p_enc->fmt_in.video.i_height);
+		//CopyToYv12(p_pict, pp_plane, pi_pitch, p_enc->fmt_in.video.i_width, p_enc->fmt_in.video.i_height);
 	}
 	else if(surface_image.format.fourcc == VA_FOURCC('N','V','1','2'))
 	{
@@ -279,7 +484,7 @@ bool UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID sur
 			pi_pitch[i] = surface_image.pitches[i];
 		}
 
-		CopyToNv12(p_pict, pp_plane, pi_pitch, p_enc->fmt_in.video.i_width, p_enc->fmt_in.video.i_height);
+		//CopyToNv12(p_pict, pp_plane, pi_pitch, p_enc->fmt_in.video.i_width, p_enc->fmt_in.video.i_height);
 	}
 	else
 	{
@@ -299,31 +504,36 @@ bool UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID sur
 block_t *GenCodedBlock(encoder_t *p_enc)
 {
 	encoder_sys_t *p_sys = p_enc->p_sys;
-	
+
 	VACodedBufferSegment *buf_list = 0;
 	VAStatus va_status;
-	
+
+	if(p_sys->first_frame)
+	{
+		p_sys->first_frame = 0;
+	}
+
 	va_status = vaMapBuffer(p_sys->va_dpy, p_sys->coded_buf, (void**)(&buf_list));
 	CHECK_VASTATUS(va_status, "vaMapBuffer", 0);
 	msg_Dbg(p_enc, "Mapped output buffer");
 
 	block_t *block = 0;
 	block_t *chain = 0;
-	
+
 	while(buf_list != 0)
 	{
 		block = block_Alloc(buf_list->size);
 		block_ChainAppend(&chain, block);
-		
+
 		memcpy(block->p_buffer, buf_list->buf, buf_list->size);
 		msg_Dbg(p_enc, "Added Block with size %d to chain", buf_list->size);
-		
+
 		buf_list = (VACodedBufferSegment*)buf_list->next;
 	}
-	
+
 	vaUnmapBuffer(p_sys->va_dpy, p_sys->coded_buf);
 	msg_Dbg(p_enc, "Done Writing output");
-	
+
 	return chain;
 }
 
@@ -352,20 +562,17 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 	p_sys->pic_h264.reference_picture = p_sys->surface_id[SID_REFERENCE_PICTURE];
     p_sys->pic_h264.reconstructed_picture = p_sys->surface_id[SID_RECON_PICTURE];
     p_sys->pic_h264.coded_buf = p_sys->coded_buf;
-    p_sys->pic_h264.picture_width = p_enc->fmt_in.video.i_width;
-    p_sys->pic_h264.picture_height = p_enc->fmt_in.video.i_height;
+    p_sys->pic_h264.picture_width = p_sys->picture_width;
+    p_sys->pic_h264.picture_height = p_sys->picture_height;
     p_sys->pic_h264.last_picture = 0;
 	if(p_sys->pic_parameter != VA_INVALID_ID)
 		vaDestroyBuffer(p_sys->va_dpy, p_sys->pic_parameter);
 
 	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncPictureParameterBufferType, sizeof(p_sys->pic_h264), 1, &(p_sys->pic_h264), &(p_sys->pic_parameter));
 	CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
-	
-	msg_Dbg(p_enc, "Created Enc Buffer");
-
 	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->pic_parameter), 1);
     CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
-	
+
 	msg_Dbg(p_enc, "Rendered Picture");
 
 	va_status = vaMapBuffer(p_sys->va_dpy, p_sys->coded_buf, (void **)(&coded_buffer_segment));
@@ -376,7 +583,7 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 	msg_Dbg(p_enc, "Cleared Coded Mem");
 
 	p_sys->slice_h264.start_row_number = 0;
-    p_sys->slice_h264.slice_height = (p_enc->fmt_in.video.i_height + 15)/16;
+    p_sys->slice_h264.slice_height = p_sys->picture_height/16;
     p_sys->slice_h264.slice_flags.bits.is_intra = (p_sys->intra_counter == 0); //TODO: Find out about the intra/idr frame handling
     p_sys->slice_h264.slice_flags.bits.disable_deblocking_filter_idc = 0;
 	if(p_sys->slice_parameter != VA_INVALID_ID)
@@ -384,12 +591,12 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 
 	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncSliceParameterBufferType, sizeof(p_sys->slice_h264), 1, &(p_sys->slice_h264), &(p_sys->slice_parameter));
 	CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
-	
+
 	msg_Dbg(p_enc, "Created enc buffer 2");
 
 	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->slice_parameter), 1);
 	CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
-	
+
 	msg_Dbg(p_enc, "Rendered Picture again");
 
 	tempID = p_sys->surface_id[SID_RECON_PICTURE];
@@ -397,32 +604,13 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 	p_sys->surface_id[SID_REFERENCE_PICTURE] = tempID;
 
 	va_status = vaEndPicture(p_sys->va_dpy, p_sys->context_id);
-	CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
+	CHECK_VASTATUS(va_status, "vaEndPicture", 0);
 
 	msg_Dbg(p_enc, "Done");
 
 	p_sys->intra_counter += 1;
 	if(p_sys->intra_counter >= p_sys->intra_rate)
 		p_sys->intra_counter = 0;
-	
+
 	return GenCodedBlock(p_enc);
 }
-
-/*****************************************************************************
- * CloseDecoder: decoder destruction
- *****************************************************************************/
-static void CloseEncoder( vlc_object_t *p_this )
-{
-	encoder_t *p_enc = (encoder_t *)p_this;
-	encoder_sys_t *p_sys = p_enc->p_sys;
-
-	vaDestroyBuffer(p_sys->va_dpy, p_sys->coded_buf);
-	vaDestroySurfaces(p_sys->va_dpy, &(p_sys->surface_id[0]), SID_NUMBER);
-	vaDestroyBuffer(p_sys->va_dpy, p_sys->seq_parameter);
-	vaDestroyContext(p_sys->va_dpy, p_sys->context_id);
-	vaDestroyConfig(p_sys->va_dpy, p_sys->config_id);
-	vaTerminate(p_sys->va_dpy);
-	XCloseDisplay(p_sys->x11_display);
-	free(p_sys);
-}
-

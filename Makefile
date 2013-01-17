@@ -16,8 +16,8 @@ override CFLAGS += -fPIC
 override LDFLAGS += -Wl,-no-undefined,-z,defs
 
 override CFLAGS += -DMODULE_STRING=\"h264-vaapi\"
-override CFLAGS += $(VLC_PLUGIN_CFLAGS) $(shell pkg-config --cflags libva-x11) $(shell pkg-config --cflags x11)
-override LDFLAGS += $(VLC_PLUGIN_LIBS) $(shell pkg-config --libs libva-x11) $(shell pkg-config --libs x11)
+override CFLAGS += $(VLC_PLUGIN_CFLAGS) $(shell pkg-config --cflags libva-x11 libva-drm x11)
+override LDFLAGS += $(VLC_PLUGIN_LIBS) $(shell pkg-config --libs libva-x11 libva-drm x11)
 
 TARGETS = libh264-vaapi-enc_plugin.so
 
