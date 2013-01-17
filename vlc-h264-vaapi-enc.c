@@ -416,6 +416,11 @@ static int OpenEncoder( vlc_object_t *p_this )
 		CHECK_VASTATUS(va_status, "vaDeriveImage", false);
 
 		p_enc->fmt_in.i_codec = test_image.format.fourcc;
+		
+		char str[5];
+		str[4] = 0;
+		vlc_fourcc_to_char(p_enc->fmt_in.i_codec, str);
+		msg_Info(p_enc, "Negotiated to fourcc format \"%s\"", str);
 
 		va_status = vaDestroyImage(p_sys->va_dpy, test_image.image_id);
 		CHECK_VASTATUS(va_status, "vaDestroyImage", false);
@@ -458,7 +463,7 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
 	VAStatus va_status;
 	VASurfaceStatus surface_status = 0;
 
-	va_status = vaSyncSurface(p_sys->va_dpy, p_sys->surface_ids[SID_INPUT_PICTURE]);
+	va_status = vaSyncSurface(p_sys->va_dpy, p_sys->surface_id[SID_INPUT_PICTURE]);
 	CHECK_VASTATUS(va_status, "vaSyncSurface", 0);
 	
 	va_status = vaQuerySurfaceStatus(p_sys->va_dpy, p_sys->surface_id[SID_INPUT_PICTURE], &surface_status);
@@ -481,12 +486,39 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
 		buf_list = (VACodedBufferSegment*)buf_list->next;
 	}
 
+	chain->i_pts = date;
+	chain->i_dts = 0; ///TODO?!
+	chain->i_flags = (is_intra?BLOCK_FLAG_TYPE_I:BLOCK_FLAG_TYPE_P);
+
 	vaUnmapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id);
 	msg_Dbg(p_enc, "Done Writing output");
 
 	return chain;
 }
- 
+
+int UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID surface_id)
+{
+	encoder_sys_t *p_sys = p_enc->p_sys;
+	
+	VAImage surface_image;
+	uint8_t *surface_p = 0;
+
+	VAStatus va_status = vaDeriveImage(p_sys->va_dpy, surface_id, &surface_image);
+	CHECK_VASTATUS(va_status, "vaDeriveImage", 0);
+
+	va_status = vaMapBuffer(p_sys->va_dpy, surface_image.buf, (void**)&surface_p);
+	CHECK_VASTATUS(va_status, "vaMapBuffer", 0);
+	
+	int i;
+	for(i = 0; i < p_pict->i_planes; i++)
+		memcpy(surface_p + surface_image.offsets[i], p_pict->p[i].p_pixels, p_pict->p[i].i_lines * p_pict->p[i].i_pitch);
+
+	vaUnmapBuffer(p_sys->va_dpy, surface_image.buf);
+	vaDestroyImage(p_sys->va_dpy, surface_image.image_id);
+	
+	return 1;
+}
+
 static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 {
 	VABufferID tempID;
@@ -509,7 +541,8 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->seq_param_buf_id), 1);
 	CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
 
-	//TODO: Upload YUV
+	if(!UploadPictureToSurface(p_enc, p_pict, p_sys->surface_id[SID_INPUT_PICTURE]))
+		return 0;
 
 	if(p_sys->pic_param_buf_id != VA_INVALID_ID)
 		vaDestroyBuffer(p_sys->va_dpy, p_sys->pic_param_buf_id);
@@ -526,10 +559,10 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 	memset(coded_buffer_segment->buf, 0, coded_buffer_segment->size);
 	vaUnmapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id);
 
-	p_sys->slice_param[0].start_row_number = 0;
-	p_sys->slice_param[0].slice_height = p_sys->picture_height/16;
-	p_sys->slice_param[0].slice_flags.bits.is_intra = is_intra;
-	p_sys->slice_param[0].slice_flags.bits.disable_deblocking_filter_idc = 0;
+	p_sys->slice_param[0].slice_type = (is_intra?SLICE_TYPE_I:SLICE_TYPE_P);
+	p_sys->slice_param[0].num_macroblocks = p_sys->picture_height_in_mbs * p_sys->picture_width_in_mbs;
+	p_sys->slice_param[0].slice_alpha_c0_offset_div2 = 2;
+    p_sys->slice_param[0].slice_beta_offset_div2 = 2;
 	if(p_sys->slice_param_buf_id[0] != VA_INVALID_ID)
 		vaDestroyBuffer(p_sys->va_dpy, p_sys->slice_param_buf_id[0]);
 	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncSliceParameterBufferType, sizeof(p_sys->slice_param[0]), 1, &(p_sys->slice_param[0]), &(p_sys->slice_param_buf_id[0]));
