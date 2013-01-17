@@ -80,8 +80,9 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict );
 
 #define MAX_SLICES                32
 #define SID_INPUT_PICTURE          0
-#define SID_REFERENCE_PICTURE      1
-#define SID_RECON_PICTURE          2
+#define SID_REFERENCE_PICTURE_1    1
+#define SID_REFERENCE_PICTURE_2    2
+#define SID_RECON_PICTURE          3
 #define SID_NUMBER                              SID_RECON_PICTURE + 1
 struct encoder_sys_t
 {
@@ -546,8 +547,9 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 
 	if(p_sys->pic_param_buf_id != VA_INVALID_ID)
 		vaDestroyBuffer(p_sys->va_dpy, p_sys->pic_param_buf_id);
-	p_sys->pic_param.ReferenceFrames[0].picture_id = p_sys->surface_id[SID_REFERENCE_PICTURE];
-	p_sys->pic_param.ReferenceFrames[1].picture_id = VA_INVALID_ID;
+	p_sys->pic_param.ReferenceFrames[0].picture_id = p_sys->surface_id[SID_REFERENCE_PICTURE_1];
+	p_sys->pic_param.ReferenceFrames[1].picture_id = p_sys->surface_id[SID_REFERENCE_PICTURE_2];
+	p_sys->pic_param.ReferenceFrames[2].picture_id = VA_INVALID_ID;
 	p_sys->pic_param.CurrPic.picture_id = p_sys->surface_id[SID_RECON_PICTURE];
 	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncPictureParameterBufferType, sizeof(p_sys->pic_param), 1, &p_sys->pic_param, &p_sys->pic_param_buf_id);
 	CHECK_VASTATUS(va_status,"vaCreateBuffer", 0);
@@ -571,8 +573,8 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 	CHECK_VASTATUS(va_status,"vaRenderPicture", 0);
 
 	tempID = p_sys->surface_id[SID_RECON_PICTURE];
-	p_sys->surface_id[SID_RECON_PICTURE] = p_sys->surface_id[SID_REFERENCE_PICTURE];
-	p_sys->surface_id[SID_REFERENCE_PICTURE] = tempID;
+	p_sys->surface_id[SID_RECON_PICTURE] = p_sys->surface_id[SID_REFERENCE_PICTURE_1];
+	p_sys->surface_id[SID_REFERENCE_PICTURE_1] = tempID;
 
 	va_status = vaEndPicture(p_sys->va_dpy , p_sys->context_id);
 	CHECK_VASTATUS(va_status, "vaEndPicture", 0);
