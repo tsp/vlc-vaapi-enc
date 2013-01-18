@@ -756,6 +756,23 @@ build_packed_seq_buffer(encoder_t *p_enc, unsigned char **header_buffer)
     return bs.bit_offset;
 }
 
+static int safe_destroy_buffers(encoder_t *p_enc, VABufferID *va_buffers, unsigned int num_va_buffers)
+{
+	encoder_sys_t *p_sys = p_enc->p_sys;
+    VAStatus va_status;
+    unsigned int i;
+
+    for (i = 0; i < num_va_buffers; i++) {
+        if (va_buffers[i] != VA_INVALID_ID) {
+            va_status = vaDestroyBuffer(p_sys->va_dpy, va_buffers[i]);
+            CHECK_VASTATUS(va_status, "vaDestroyBuffer", 0);
+            va_buffers[i] = VA_INVALID_ID;
+        }
+    }
+
+    return 1;
+}
+
 block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
 {
 	encoder_sys_t *p_sys = p_enc->p_sys;
@@ -953,5 +970,15 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 	p_sys->surface_id[SID_RECON_PICTURE] = p_sys->surface_id[SID_REFERENCE_PICTURE_1];
 	p_sys->surface_id[SID_REFERENCE_PICTURE_1] = tempID;
 
-	return GenCodedBlock(p_enc, is_intra, p_pict->date);
+	block_t *res = GenCodedBlock(p_enc, is_intra, p_pict->date);
+
+    safe_destroy_buffers(p_enc, &p_sys->packed_seq_header_param_buf_id, 1);
+    safe_destroy_buffers(p_enc, &p_sys->packed_seq_buf_id, 1);
+    safe_destroy_buffers(p_enc, &p_sys->packed_pic_header_param_buf_id, 1);
+    safe_destroy_buffers(p_enc, &p_sys->packed_pic_buf_id, 1);
+    safe_destroy_buffers(p_enc, &p_sys->packed_sei_header_param_buf_id, 1);
+    safe_destroy_buffers(p_enc, &p_sys->packed_sei_buf_id, 1);
+    safe_destroy_buffers(p_enc, &p_sys->misc_parameter_hrd_buf_id, 1);
+	
+	return res;
 }
