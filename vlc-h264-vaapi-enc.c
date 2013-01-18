@@ -97,7 +97,7 @@ struct encoder_sys_t
 	int qp_value;
 	int frame_bit_rate;
 
-	uint32_t intra_counter;
+	uint64_t intra_counter;
 	uint32_t intra_rate;
 	uint32_t first_frame;
 
@@ -804,9 +804,10 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
 
 	memcpy(block->p_buffer, buf_list->buf, buf_list->size);
 
-	block->i_pts = 0; // date;
+	block->i_length = INT64_C(1000000) * p_enc->fmt_in.video.i_frame_rate_base / p_enc->fmt_in.video.i_frame_rate;
+	block->i_pts = date;
 	block->i_dts = 0; ///TODO?!
-	block->i_flags = (is_intra?BLOCK_FLAG_TYPE_I:BLOCK_FLAG_TYPE_P);
+	block->i_flags |= (is_intra?BLOCK_FLAG_TYPE_I:BLOCK_FLAG_TYPE_P);
 
 	vaUnmapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id);
 
@@ -838,6 +839,8 @@ int UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID surf
 
 static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 {
+	VAEncMiscParameterBuffer *misc_param;
+	VAEncMiscParameterHRD *misc_hrd_param;
 	VABufferID tempID;
 	VAStatus va_status;
 	VACodedBufferSegment *coded_buffer_segment = 0;
@@ -847,10 +850,12 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 	int is_idr = 0;
 
 	encoder_sys_t *p_sys = p_enc->p_sys;
+	
+	if(!p_pict)
+		return 0;
 
 	if(p_sys->intra_counter % p_sys->intra_rate == 0)
 	{
-		p_sys->intra_counter = 0;
 		is_intra = 1;
 	}
 	p_sys->intra_counter += 1;
@@ -865,8 +870,6 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 		VAEncPackedHeaderParameterBuffer packed_header_param_buffer;
 		unsigned int length_in_bits;
         unsigned char *packed_seq_buffer = NULL, *packed_pic_buffer = NULL;
-		VAEncMiscParameterBuffer *misc_param;
-		VAEncMiscParameterHRD *misc_hrd_param;
 
 		length_in_bits = build_packed_seq_buffer(p_enc, &packed_seq_buffer);
 		packed_header_param_buffer.type = VAEncPackedHeaderSequence;
@@ -889,30 +892,31 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
         va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncPackedHeaderDataBufferType, (length_in_bits + 7) / 8, 1, packed_pic_buffer, &p_sys->packed_pic_buf_id);
         CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
 
-		vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncMiscParameterBufferType, sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl), 1, NULL,  &p_sys->misc_parameter_hrd_buf_id);
-		CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
-
-		vaMapBuffer(p_sys->va_dpy, p_sys->misc_parameter_hrd_buf_id, (void **)&misc_param);
-		misc_param->type = VAEncMiscParameterTypeHRD;
-		misc_hrd_param = (VAEncMiscParameterHRD *)misc_param->data;
-
-		if (p_sys->frame_bit_rate > 0)
-		{
-			misc_hrd_param->initial_buffer_fullness = p_sys->frame_bit_rate * 1024 * 4;
-			misc_hrd_param->buffer_size = p_sys->frame_bit_rate * 1024 * 8;
-		}
-		else
-		{
-			misc_hrd_param->initial_buffer_fullness = 0;
-			misc_hrd_param->buffer_size = 0;
-		}
-
-		vaUnmapBuffer(p_sys->va_dpy, p_sys->misc_parameter_hrd_buf_id);
-
 		free(packed_seq_buffer);
 		free(packed_pic_buffer);
 		p_sys->first_frame = 0;
 	}
+
+	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncMiscParameterBufferType, sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl), 1, NULL,  &p_sys->misc_parameter_hrd_buf_id);
+	CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
+
+	va_status = vaMapBuffer(p_sys->va_dpy, p_sys->misc_parameter_hrd_buf_id, (void **)&misc_param);
+	CHECK_VASTATUS(va_status, "vaMapBuffer", 0);
+	misc_param->type = VAEncMiscParameterTypeHRD;
+	misc_hrd_param = (VAEncMiscParameterHRD *)misc_param->data;
+
+	if (p_sys->frame_bit_rate > 0)
+	{
+		misc_hrd_param->initial_buffer_fullness = p_sys->frame_bit_rate * 1024 * 4;
+		misc_hrd_param->buffer_size = p_sys->frame_bit_rate * 1024 * 8;
+	}
+	else
+	{
+		misc_hrd_param->initial_buffer_fullness = 0;
+		misc_hrd_param->buffer_size = 0;
+	}
+
+	vaUnmapBuffer(p_sys->va_dpy, p_sys->misc_parameter_hrd_buf_id);
 
 	p_sys->slice_param[0].slice_type = (is_intra?SLICE_TYPE_I:SLICE_TYPE_P);
 	p_sys->slice_param[0].num_macroblocks = p_sys->picture_height_in_mbs * p_sys->picture_width_in_mbs;
@@ -929,8 +933,10 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 	p_sys->pic_param.ReferenceFrames[1].picture_id = p_sys->surface_id[SID_REFERENCE_PICTURE_2];
 	p_sys->pic_param.ReferenceFrames[2].picture_id = VA_INVALID_ID;
 	p_sys->pic_param.CurrPic.picture_id = p_sys->surface_id[SID_RECON_PICTURE];
+	p_sys->pic_param.CurrPic.TopFieldOrderCnt = p_sys->intra_counter * 2;
 	p_sys->pic_param.pic_fields.bits.idr_pic_flag = !!is_idr;
 	p_sys->pic_param.pic_fields.bits.reference_pic_flag = (p_sys->slice_param[0].slice_type != SLICE_TYPE_B);
+	p_sys->pic_param.frame_num = p_sys->intra_counter;
 	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncPictureParameterBufferType, sizeof(p_sys->pic_param), 1, &p_sys->pic_param, &p_sys->pic_param_buf_id);
 	CHECK_VASTATUS(va_status,"vaCreateBuffer", 0);
 
