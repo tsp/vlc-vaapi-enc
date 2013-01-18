@@ -790,12 +790,21 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
 	va_status = vaMapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id, (void**)(&buf_list));
 	CHECK_VASTATUS(va_status, "vaMapBuffer", 0);
 
-	block_t *block = block_Alloc(buf_list->size);;
+	if(buf_list->status & VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK)
+	{
+		msg_Err(p_enc, "Output buffer overflown");
+		return 0;
+	}
+	else
+	{
+		msg_Dbg(p_enc, "Encoded %d bytes at %lld", buf_list->size, (long long int)date);
+	}
+	
+	block_t *block = block_Alloc(buf_list->size);
 
 	memcpy(block->p_buffer, buf_list->buf, buf_list->size);
 
-
-	block->i_pts = date;
+	block->i_pts = 0; // date;
 	block->i_dts = 0; ///TODO?!
 	block->i_flags = (is_intra?BLOCK_FLAG_TYPE_I:BLOCK_FLAG_TYPE_P);
 
