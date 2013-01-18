@@ -242,8 +242,16 @@ static int OpenEncoder( vlc_object_t *p_this )
             else
                 p_sys->seq_param.bits_per_second = 0;
 
-            p_sys->seq_param.time_scale = p_enc->fmt_in.video.i_frame_rate;
-            p_sys->seq_param.num_units_in_tick = p_enc->fmt_in.video.i_frame_rate_base;
+            if(p_enc->fmt_in.video.i_frame_rate > 0 && p_enc->fmt_in.video.i_frame_rate_base > 0)
+            {
+                p_sys->seq_param.time_scale = p_enc->fmt_in.video.i_frame_rate;
+                p_sys->seq_param.num_units_in_tick = p_enc->fmt_in.video.i_frame_rate_base;
+            }
+            else
+            {
+                p_sys->seq_param.time_scale = 0;
+                p_sys->seq_param.num_units_in_tick = 0;
+            }
 
             if(p_sys->picture_height_in_mbs * 16 - p_sys->picture_height)
             {
@@ -264,7 +272,8 @@ static int OpenEncoder( vlc_object_t *p_this )
             p_sys->seq_param.seq_fields.bits.log2_max_frame_num_minus4 = 0;
             p_sys->seq_param.seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 = 2;
 
-            p_sys->seq_param.vui_parameters_present_flag = 1;
+            
+            p_sys->seq_param.vui_parameters_present_flag = (p_sys->seq_param.time_scale > 0 || p_sys->frame_bit_rate > 0)?1:0;
         }
 
         { // Initialize pic_param
@@ -646,46 +655,59 @@ static void sps_rbsp(encoder_t *p_enc, bitstream *bs)
         bitstream_put_ue(bs, seq_param->frame_crop_bottom_offset);      /* frame_crop_bottom_offset */
     }
 
-
-    bitstream_put_ui(bs, 1, 1); /* vui_parameters_present_flag */
-    bitstream_put_ui(bs, 0, 1); /* aspect_ratio_info_present_flag */
-    bitstream_put_ui(bs, 0, 1); /* overscan_info_present_flag */
-    bitstream_put_ui(bs, 0, 1); /* video_signal_type_present_flag */
-    bitstream_put_ui(bs, 0, 1); /* chroma_loc_info_present_flag */
-    bitstream_put_ui(bs, 1, 1); /* timing_info_present_flag */
+    if((seq_param->num_units_in_tick > 0 && seq_param->time_scale > 0) || p_sys->frame_bit_rate > 0)
     {
-        bitstream_put_ui(bs, seq_param->num_units_in_tick, 32);
-        bitstream_put_ui(bs, seq_param->time_scale, 32);
-        bitstream_put_ui(bs, 1, 1);
-    }
+        bitstream_put_ui(bs, 1, 1); /* vui_parameters_present_flag */
+        bitstream_put_ui(bs, 0, 1); /* aspect_ratio_info_present_flag */
+        bitstream_put_ui(bs, 0, 1); /* overscan_info_present_flag */
+        bitstream_put_ui(bs, 0, 1); /* video_signal_type_present_flag */
+        bitstream_put_ui(bs, 0, 1); /* chroma_loc_info_present_flag */
+        if(seq_param->num_units_in_tick > 0 && seq_param->time_scale > 0)
+        {
+            bitstream_put_ui(bs, 1, 1); /* timing_info_present_flag */
+            {
+                bitstream_put_ui(bs, seq_param->num_units_in_tick, 32);
+                bitstream_put_ui(bs, seq_param->time_scale, 32);
+                bitstream_put_ui(bs, 1, 1);
+            }
+        }
+        else
+        {
+            bitstream_put_ui(bs, 0, 1); /* timing_info_present_flag */
+        }
 
-    if(p_sys->frame_bit_rate <= 0)
-    {
-        bitstream_put_ui(bs, 0, 1);/* nal_hrd_parameters_present_flag */
+        if(p_sys->frame_bit_rate <= 0)
+        {
+            bitstream_put_ui(bs, 0, 1);/* nal_hrd_parameters_present_flag */
+        }
+        else
+        {
+            bitstream_put_ui(bs, 1, 1); /* nal_hrd_parameters_present_flag */
+
+            // hrd_parameters
+            bitstream_put_ue(bs, 0);    /* cpb_cnt_minus1 */
+            bitstream_put_ui(bs, 4, 4); /* bit_rate_scale */
+            bitstream_put_ui(bs, 6, 4); /* cpb_size_scale */
+
+            bitstream_put_ue(bs, p_sys->frame_bit_rate - 1); /* bit_rate_value_minus1[0] */
+            bitstream_put_ue(bs, p_sys->frame_bit_rate*8 - 1); /* cpb_size_value_minus1[0] */
+            bitstream_put_ui(bs, 1, 1);  /* cbr_flag[0] */
+
+            bitstream_put_ui(bs, 23, 5);   /* initial_cpb_removal_delay_length_minus1 */
+            bitstream_put_ui(bs, 23, 5);   /* cpb_removal_delay_length_minus1 */
+            bitstream_put_ui(bs, 23, 5);   /* dpb_output_delay_length_minus1 */
+            bitstream_put_ui(bs, 23, 5);   /* time_offset_length  */
+        }
+        bitstream_put_ui(bs, 0, 1);   /* vcl_hrd_parameters_present_flag */
+        bitstream_put_ui(bs, 0, 1);   /* low_delay_hrd_flag */
+
+        bitstream_put_ui(bs, 0, 1); /* pic_struct_present_flag */
+        bitstream_put_ui(bs, 0, 1); /* bitstream_restriction_flag */
     }
     else
     {
-        bitstream_put_ui(bs, 1, 1); /* nal_hrd_parameters_present_flag */
-
-        // hrd_parameters
-        bitstream_put_ue(bs, 0);    /* cpb_cnt_minus1 */
-        bitstream_put_ui(bs, 4, 4); /* bit_rate_scale */
-        bitstream_put_ui(bs, 6, 4); /* cpb_size_scale */
-
-        bitstream_put_ue(bs, p_sys->frame_bit_rate - 1); /* bit_rate_value_minus1[0] */
-        bitstream_put_ue(bs, p_sys->frame_bit_rate*8 - 1); /* cpb_size_value_minus1[0] */
-        bitstream_put_ui(bs, 1, 1);  /* cbr_flag[0] */
-
-        bitstream_put_ui(bs, 23, 5);   /* initial_cpb_removal_delay_length_minus1 */
-        bitstream_put_ui(bs, 23, 5);   /* cpb_removal_delay_length_minus1 */
-        bitstream_put_ui(bs, 23, 5);   /* dpb_output_delay_length_minus1 */
-        bitstream_put_ui(bs, 23, 5);   /* time_offset_length  */
+        bitstream_put_ui(bs, 0, 1); /* vui_parameters_present_flag */
     }
-    bitstream_put_ui(bs, 0, 1);   /* vcl_hrd_parameters_present_flag */
-    bitstream_put_ui(bs, 0, 1);   /* low_delay_hrd_flag */
-
-    bitstream_put_ui(bs, 0, 1); /* pic_struct_present_flag */
-    bitstream_put_ui(bs, 0, 1); /* bitstream_restriction_flag */
 
     rbsp_trailing_bits(bs);     /* rbsp_trailing_bits */
 }
@@ -842,7 +864,7 @@ static int safe_destroy_buffers(encoder_t *p_enc, VABufferID *va_buffers, unsign
     return 1;
 }
 
-block_t *GenCodedBlock(encoder_t *p_enc, int is_intra)
+block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
 {
     encoder_sys_t *p_sys = p_enc->p_sys;
 
@@ -869,9 +891,17 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra)
 
     memcpy(block->p_buffer, buf_list->buf, buf_list->size);
 
-    block->i_length = INT64_C(1000000) * p_enc->fmt_in.video.i_frame_rate_base / p_enc->fmt_in.video.i_frame_rate;
-    block->i_pts = p_sys->pts;
-    block->i_dts = p_sys->pts; //FIXME/TODO?
+    if(p_sys->seq_param.time_scale > 0 && p_sys->seq_param.num_units_in_tick > 0)
+    {
+        block->i_length = INT64_C(1000000) * p_sys->seq_param.num_units_in_tick / p_sys->seq_param.time_scale;
+        block->i_pts = p_sys->pts;
+        block->i_dts = p_sys->pts;
+    } else {
+        block->i_length = 0;
+        block->i_pts = date;
+        block->i_dts = date; //FIXME/TODO?
+    }
+    
     block->i_flags |= (is_intra?BLOCK_FLAG_TYPE_I:BLOCK_FLAG_TYPE_P);
 
     p_sys->pts += block->i_length;
@@ -1085,7 +1115,7 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
     p_sys->surface_id[SID_RECON_PICTURE] = p_sys->surface_id[SID_REFERENCE_PICTURE_1];
     p_sys->surface_id[SID_REFERENCE_PICTURE_1] = tempID;
 
-    block_t *res = GenCodedBlock(p_enc, is_intra);
+    block_t *res = GenCodedBlock(p_enc, is_intra, p_pict->date);
 
     safe_destroy_buffers(p_enc, &p_sys->seq_param_buf_id, 1);
     safe_destroy_buffers(p_enc, &p_sys->packed_seq_header_param_buf_id, 1);
