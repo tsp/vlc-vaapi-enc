@@ -90,6 +90,8 @@ struct encoder_sys_t
     Display *x11_display;
     int drm_fd;
 
+    mtime_t pts;
+
     int picture_width;
     int picture_height;
     int picture_width_in_mbs;
@@ -171,6 +173,7 @@ static int OpenEncoder( vlc_object_t *p_this )
         p_sys->intra_rate = 30;
         p_sys->intra_counter = 0;
         p_sys->first_frame = 1;
+        p_sys->pts = 0;
 
         p_sys->profile = VAProfileH264High;
 
@@ -239,8 +242,8 @@ static int OpenEncoder( vlc_object_t *p_this )
             else
                 p_sys->seq_param.bits_per_second = 0;
 
-            p_sys->seq_param.time_scale = p_enc->fmt_in.video.i_frame_rate_base;
-            p_sys->seq_param.num_units_in_tick = p_enc->fmt_in.video.i_frame_rate;
+            p_sys->seq_param.time_scale = p_enc->fmt_in.video.i_frame_rate;
+            p_sys->seq_param.num_units_in_tick = p_enc->fmt_in.video.i_frame_rate_base;
 
             if(p_sys->picture_height_in_mbs * 16 - p_sys->picture_height)
             {
@@ -395,9 +398,6 @@ static int OpenEncoder( vlc_object_t *p_this )
     } /// DONE CREATING PIPE
 
     { /// START ALLOC RESOURCES
-        va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncSequenceParameterBufferType, sizeof(p_sys->seq_param), 1, &(p_sys->seq_param), &(p_sys->seq_param_buf_id));
-        CHECK_VASTATUS(va_status, "vaCreateBuffer", VLC_EGENERIC);
-
         va_status = vaCreateSurfaces(
             p_sys->va_dpy,
             VA_RT_FORMAT_YUV420, p_sys->picture_width, p_sys->picture_height,
@@ -441,7 +441,6 @@ static void CloseEncoder( vlc_object_t *p_this )
 
     vaDestroyBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id);
     vaDestroySurfaces(p_sys->va_dpy, &(p_sys->surface_id[0]), SID_NUMBER);
-    vaDestroyBuffer(p_sys->va_dpy, p_sys->seq_param_buf_id);
     vaDestroyContext(p_sys->va_dpy, p_sys->context_id);
     vaDestroyConfig(p_sys->va_dpy, p_sys->config_id);
     vaTerminate(p_sys->va_dpy);
@@ -844,7 +843,7 @@ static int safe_destroy_buffers(encoder_t *p_enc, VABufferID *va_buffers, unsign
 
 static int tfd = -1;
 
-block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
+block_t *GenCodedBlock(encoder_t *p_enc, int is_intra)
 {
     encoder_sys_t *p_sys = p_enc->p_sys;
 
@@ -880,9 +879,11 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
     }
 
     block->i_length = INT64_C(1000000) * p_enc->fmt_in.video.i_frame_rate_base / p_enc->fmt_in.video.i_frame_rate;
-    block->i_pts = date;
-    block->i_dts = date; ///TODO?!
+    block->i_pts = p_sys->pts;
+    block->i_dts = p_sys->pts; //TODO?
     block->i_flags |= (is_intra?BLOCK_FLAG_TYPE_I:BLOCK_FLAG_TYPE_P);
+    
+    p_sys->pts += block->i_length;
 
     vaUnmapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id);
 
@@ -914,7 +915,7 @@ int UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID surf
 
     for(int i = 0; i < p_pict->i_planes; i++)
     {
-        CopyPlane(surface_p + surface_image.offsets[i], surface_image.pitches[i], p_pict->p[i].p_pixels, p_pict->p[i].i_pitch, p_pict->p[i].i_visible_pitch, p_pict->p[i].i_visible_lines);
+        CopyPlane(surface_p + surface_image.offsets[i], surface_image.pitches[i], p_pict->p[i].p_pixels, p_pict->p[i].i_pitch, p_pict->p[i].i_pitch, p_pict->p[i].i_visible_lines);
     }
 
     vaUnmapBuffer(p_sys->va_dpy, surface_image.buf);
@@ -982,6 +983,9 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
         p_sys->first_frame = 0;
     }
 
+    va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncSequenceParameterBufferType, sizeof(p_sys->seq_param), 1, &(p_sys->seq_param), &(p_sys->seq_param_buf_id));
+    CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
+
     va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncMiscParameterBufferType, sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl), 1, NULL,  &p_sys->misc_parameter_hrd_buf_id);
     CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
 
@@ -1002,7 +1006,7 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
     }
 
     vaUnmapBuffer(p_sys->va_dpy, p_sys->misc_parameter_hrd_buf_id);
-
+    
     p_sys->slice_param[0].slice_type = (is_intra?SLICE_TYPE_I:SLICE_TYPE_P);
     p_sys->slice_param[0].num_macroblocks = p_sys->picture_height_in_mbs * p_sys->picture_width_in_mbs;
     p_sys->slice_param[0].slice_alpha_c0_offset_div2 = 2;
@@ -1090,8 +1094,9 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
     p_sys->surface_id[SID_RECON_PICTURE] = p_sys->surface_id[SID_REFERENCE_PICTURE_1];
     p_sys->surface_id[SID_REFERENCE_PICTURE_1] = tempID;
 
-    block_t *res = GenCodedBlock(p_enc, is_intra, p_pict->date);
+    block_t *res = GenCodedBlock(p_enc, is_intra);
 
+    safe_destroy_buffers(p_enc, &p_sys->seq_param_buf_id, 1);
     safe_destroy_buffers(p_enc, &p_sys->packed_seq_header_param_buf_id, 1);
     safe_destroy_buffers(p_enc, &p_sys->packed_seq_buf_id, 1);
     safe_destroy_buffers(p_enc, &p_sys->packed_pic_header_param_buf_id, 1);
