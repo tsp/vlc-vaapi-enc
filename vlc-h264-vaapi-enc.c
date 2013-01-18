@@ -197,7 +197,7 @@ static int OpenEncoder( vlc_object_t *p_this )
 		p_sys->packed_pic_buf_id = VA_INVALID_ID;
 		p_sys->codedbuf_buf_id = VA_INVALID_ID;
 		p_sys->misc_parameter_hrd_buf_id = VA_INVALID_ID;
-		p_sys->codedbuf_i_size = p_sys->picture_width * p_sys->picture_height * 1.5;
+		p_sys->codedbuf_i_size = p_sys->picture_width * p_sys->picture_height * 5;
 		p_sys->codedbuf_pb_size = 0;
 		p_sys->current_input_surface = SID_INPUT_PICTURE;
 		p_sys->packed_sei_header_param_buf_id = VA_INVALID_ID;
@@ -417,7 +417,7 @@ static int OpenEncoder( vlc_object_t *p_this )
 		CHECK_VASTATUS(va_status, "vaDeriveImage", false);
 
 		p_enc->fmt_in.i_codec = test_image.format.fourcc;
-		
+
 		char str[5];
 		str[4] = 0;
 		vlc_fourcc_to_char(p_enc->fmt_in.i_codec, str);
@@ -456,6 +456,306 @@ static void CloseEncoder( vlc_object_t *p_this )
  * EncodeVideo: the whole thing
  ****************************************************************************/
 
+#define BITSTREAM_ALLOCATE_STEPPING     4096
+
+struct __bitstream {
+    unsigned int *buffer;
+    int bit_offset;
+    int max_size_in_dword;
+};
+
+typedef struct __bitstream bitstream;
+
+static unsigned int 
+va_swap32(unsigned int val)
+{
+    unsigned char *pval = (unsigned char *)&val;
+
+    return ((pval[0] << 24)     |
+            (pval[1] << 16)     |
+            (pval[2] << 8)      |
+            (pval[3] << 0));
+}
+
+static void
+bitstream_start(bitstream *bs)
+{
+    bs->max_size_in_dword = BITSTREAM_ALLOCATE_STEPPING;
+    bs->buffer = calloc(bs->max_size_in_dword * sizeof(int), 1);
+    bs->bit_offset = 0;
+}
+
+static void
+bitstream_end(bitstream *bs)
+{
+    int pos = (bs->bit_offset >> 5);
+    int bit_offset = (bs->bit_offset & 0x1f);
+    int bit_left = 32 - bit_offset;
+
+    if (bit_offset) {
+        bs->buffer[pos] = va_swap32((bs->buffer[pos] << bit_left));
+    }
+}
+ 
+static void
+bitstream_put_ui(bitstream *bs, unsigned int val, int size_in_bits)
+{
+    int pos = (bs->bit_offset >> 5);
+    int bit_offset = (bs->bit_offset & 0x1f);
+    int bit_left = 32 - bit_offset;
+
+    if (!size_in_bits)
+        return;
+
+    bs->bit_offset += size_in_bits;
+
+    if (bit_left > size_in_bits) {
+        bs->buffer[pos] = (bs->buffer[pos] << size_in_bits | val);
+    } else {
+        size_in_bits -= bit_left;
+        bs->buffer[pos] = (bs->buffer[pos] << bit_left) | (val >> size_in_bits);
+        bs->buffer[pos] = va_swap32(bs->buffer[pos]);
+
+        if (pos + 1 == bs->max_size_in_dword) {
+            bs->max_size_in_dword += BITSTREAM_ALLOCATE_STEPPING;
+            bs->buffer = realloc(bs->buffer, bs->max_size_in_dword * sizeof(unsigned int));
+        }
+
+        bs->buffer[pos + 1] = val;
+    }
+}
+
+static void
+bitstream_put_ue(bitstream *bs, unsigned int val)
+{
+    int size_in_bits = 0;
+    int tmp_val = ++val;
+
+    while (tmp_val) {
+        tmp_val >>= 1;
+        size_in_bits++;
+    }
+
+    bitstream_put_ui(bs, 0, size_in_bits - 1); // leading zero
+    bitstream_put_ui(bs, val, size_in_bits);
+}
+
+static void
+bitstream_put_se(bitstream *bs, int val)
+{
+    unsigned int new_val;
+
+    if (val <= 0)
+        new_val = -2 * val;
+    else
+        new_val = 2 * val - 1;
+
+    bitstream_put_ue(bs, new_val);
+}
+
+static void
+bitstream_byte_aligning(bitstream *bs, int bit)
+{
+    int bit_offset = (bs->bit_offset & 0x7);
+    int bit_left = 8 - bit_offset;
+    int new_val;
+
+    if (!bit_offset)
+        return;
+
+    assert(bit == 0 || bit == 1);
+
+    if (bit)
+        new_val = (1 << bit_left) - 1;
+    else
+        new_val = 0;
+
+    bitstream_put_ui(bs, new_val, bit_left);
+}
+
+static void rbsp_trailing_bits(bitstream *bs)
+{
+    bitstream_put_ui(bs, 1, 1);
+    bitstream_byte_aligning(bs, 0);
+}
+
+static void nal_start_code_prefix(bitstream *bs)
+{
+    bitstream_put_ui(bs, 0x00000001, 32);
+}
+
+static void nal_header(bitstream *bs, int nal_ref_idc, int nal_unit_type)
+{
+    bitstream_put_ui(bs, 0, 1);                /* forbidden_zero_bit: 0 */
+    bitstream_put_ui(bs, nal_ref_idc, 2);
+    bitstream_put_ui(bs, nal_unit_type, 5);
+}
+
+static void sps_rbsp(encoder_t *p_enc, bitstream *bs)
+{
+	encoder_sys_t *p_sys = p_enc->p_sys;
+
+    VAEncSequenceParameterBufferH264 *seq_param = &p_sys->seq_param;
+    int profile_idc = PROFILE_IDC_BASELINE;
+
+    if (p_sys->profile == VAProfileH264High)
+        profile_idc = PROFILE_IDC_HIGH;
+    else if (p_sys->profile == VAProfileH264Main)
+        profile_idc = PROFILE_IDC_MAIN;
+
+    bitstream_put_ui(bs, profile_idc, 8);               /* profile_idc */
+    bitstream_put_ui(bs, !!(p_sys->constraint_set_flag & 1), 1);                         /* constraint_set0_flag */
+    bitstream_put_ui(bs, !!(p_sys->constraint_set_flag & 2), 1);                         /* constraint_set1_flag */
+    bitstream_put_ui(bs, !!(p_sys->constraint_set_flag & 4), 1);                         /* constraint_set2_flag */
+    bitstream_put_ui(bs, !!(p_sys->constraint_set_flag & 8), 1);                         /* constraint_set3_flag */
+    bitstream_put_ui(bs, 0, 4);                         /* reserved_zero_4bits */
+    bitstream_put_ui(bs, seq_param->level_idc, 8);      /* level_idc */
+    bitstream_put_ue(bs, seq_param->seq_parameter_set_id);      /* seq_parameter_set_id */
+
+    if ( profile_idc == PROFILE_IDC_HIGH) {
+        bitstream_put_ue(bs, 1);        /* chroma_format_idc = 1, 4:2:0 */ 
+        bitstream_put_ue(bs, 0);        /* bit_depth_luma_minus8 */
+        bitstream_put_ue(bs, 0);        /* bit_depth_chroma_minus8 */
+        bitstream_put_ui(bs, 0, 1);     /* qpprime_y_zero_transform_bypass_flag */
+        bitstream_put_ui(bs, 0, 1);     /* seq_scaling_matrix_present_flag */
+    }
+
+    bitstream_put_ue(bs, seq_param->seq_fields.bits.log2_max_frame_num_minus4); /* log2_max_frame_num_minus4 */
+    bitstream_put_ue(bs, seq_param->seq_fields.bits.pic_order_cnt_type);        /* pic_order_cnt_type */
+
+    if (seq_param->seq_fields.bits.pic_order_cnt_type == 0)
+        bitstream_put_ue(bs, seq_param->seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4);     /* log2_max_pic_order_cnt_lsb_minus4 */
+    else {
+        assert(0);
+    }
+
+    bitstream_put_ue(bs, seq_param->max_num_ref_frames);        /* num_ref_frames */
+    bitstream_put_ui(bs, 0, 1);                                 /* gaps_in_frame_num_value_allowed_flag */
+
+    bitstream_put_ue(bs, seq_param->picture_width_in_mbs - 1);  /* pic_width_in_mbs_minus1 */
+    bitstream_put_ue(bs, seq_param->picture_height_in_mbs - 1); /* pic_height_in_map_units_minus1 */
+    bitstream_put_ui(bs, seq_param->seq_fields.bits.frame_mbs_only_flag, 1);    /* frame_mbs_only_flag */
+
+    if (!seq_param->seq_fields.bits.frame_mbs_only_flag) {
+        assert(0);
+    }
+
+    bitstream_put_ui(bs, seq_param->seq_fields.bits.direct_8x8_inference_flag, 1);      /* direct_8x8_inference_flag */
+    bitstream_put_ui(bs, seq_param->frame_cropping_flag, 1);            /* frame_cropping_flag */
+
+    if (seq_param->frame_cropping_flag) {
+        bitstream_put_ue(bs, seq_param->frame_crop_left_offset);        /* frame_crop_left_offset */
+        bitstream_put_ue(bs, seq_param->frame_crop_right_offset);       /* frame_crop_right_offset */
+        bitstream_put_ue(bs, seq_param->frame_crop_top_offset);         /* frame_crop_top_offset */
+        bitstream_put_ue(bs, seq_param->frame_crop_bottom_offset);      /* frame_crop_bottom_offset */
+    }
+    
+    if ( p_sys->frame_bit_rate < 0 ) {
+        bitstream_put_ui(bs, 0, 1); /* vui_parameters_present_flag */
+    } else {
+        bitstream_put_ui(bs, 1, 1); /* vui_parameters_present_flag */
+        bitstream_put_ui(bs, 0, 1); /* aspect_ratio_info_present_flag */
+        bitstream_put_ui(bs, 0, 1); /* overscan_info_present_flag */
+        bitstream_put_ui(bs, 0, 1); /* video_signal_type_present_flag */
+        bitstream_put_ui(bs, 0, 1); /* chroma_loc_info_present_flag */
+        bitstream_put_ui(bs, 1, 1); /* timing_info_present_flag */
+        {
+            bitstream_put_ui(bs, 15, 32);
+            bitstream_put_ui(bs, 900, 32);
+            bitstream_put_ui(bs, 1, 1);
+        }
+        bitstream_put_ui(bs, 1, 1); /* nal_hrd_parameters_present_flag */
+        {
+            // hrd_parameters 
+            bitstream_put_ue(bs, 0);    /* cpb_cnt_minus1 */
+            bitstream_put_ui(bs, 4, 4); /* bit_rate_scale */
+            bitstream_put_ui(bs, 6, 4); /* cpb_size_scale */
+           
+            bitstream_put_ue(bs, p_sys->frame_bit_rate - 1); /* bit_rate_value_minus1[0] */
+            bitstream_put_ue(bs, p_sys->frame_bit_rate*8 - 1); /* cpb_size_value_minus1[0] */
+            bitstream_put_ui(bs, 1, 1);  /* cbr_flag[0] */
+
+            bitstream_put_ui(bs, 23, 5);   /* initial_cpb_removal_delay_length_minus1 */
+            bitstream_put_ui(bs, 23, 5);   /* cpb_removal_delay_length_minus1 */
+            bitstream_put_ui(bs, 23, 5);   /* dpb_output_delay_length_minus1 */
+            bitstream_put_ui(bs, 23, 5);   /* time_offset_length  */
+        }
+        bitstream_put_ui(bs, 0, 1);   /* vcl_hrd_parameters_present_flag */
+        bitstream_put_ui(bs, 0, 1);   /* low_delay_hrd_flag */ 
+
+        bitstream_put_ui(bs, 0, 1); /* pic_struct_present_flag */
+        bitstream_put_ui(bs, 0, 1); /* bitstream_restriction_flag */
+    }
+
+    rbsp_trailing_bits(bs);     /* rbsp_trailing_bits */
+}
+
+static void pps_rbsp(encoder_t *p_enc, bitstream *bs)
+{
+	encoder_sys_t *p_sys = p_enc->p_sys;
+
+    VAEncPictureParameterBufferH264 *pic_param = &p_sys->pic_param;
+
+    bitstream_put_ue(bs, pic_param->pic_parameter_set_id);      /* pic_parameter_set_id */
+    bitstream_put_ue(bs, pic_param->seq_parameter_set_id);      /* seq_parameter_set_id */
+
+    bitstream_put_ui(bs, pic_param->pic_fields.bits.entropy_coding_mode_flag, 1);  /* entropy_coding_mode_flag */
+
+    bitstream_put_ui(bs, 0, 1);                         /* pic_order_present_flag: 0 */
+
+    bitstream_put_ue(bs, 0);                            /* num_slice_groups_minus1 */
+
+    bitstream_put_ue(bs, pic_param->num_ref_idx_l0_active_minus1);      /* num_ref_idx_l0_active_minus1 */
+    bitstream_put_ue(bs, pic_param->num_ref_idx_l1_active_minus1);      /* num_ref_idx_l1_active_minus1 1 */
+
+    bitstream_put_ui(bs, pic_param->pic_fields.bits.weighted_pred_flag, 1);     /* weighted_pred_flag: 0 */
+    bitstream_put_ui(bs, pic_param->pic_fields.bits.weighted_bipred_idc, 2);	/* weighted_bipred_idc: 0 */
+
+    bitstream_put_se(bs, pic_param->pic_init_qp - 26);  /* pic_init_qp_minus26 */
+    bitstream_put_se(bs, 0);                            /* pic_init_qs_minus26 */
+    bitstream_put_se(bs, 0);                            /* chroma_qp_index_offset */
+
+    bitstream_put_ui(bs, pic_param->pic_fields.bits.deblocking_filter_control_present_flag, 1); /* deblocking_filter_control_present_flag */
+    bitstream_put_ui(bs, 0, 1);                         /* constrained_intra_pred_flag */
+    bitstream_put_ui(bs, 0, 1);                         /* redundant_pic_cnt_present_flag */
+    
+    /* more_rbsp_data */
+    bitstream_put_ui(bs, pic_param->pic_fields.bits.transform_8x8_mode_flag, 1);    /*transform_8x8_mode_flag */
+    bitstream_put_ui(bs, 0, 1);                         /* pic_scaling_matrix_present_flag */
+    bitstream_put_se(bs, pic_param->second_chroma_qp_index_offset );    /*second_chroma_qp_index_offset */
+
+    rbsp_trailing_bits(bs);
+}
+
+static int build_packed_pic_buffer(encoder_t *p_enc, unsigned char **header_buffer)
+{
+    bitstream bs;
+
+    bitstream_start(&bs);
+    nal_start_code_prefix(&bs);
+    nal_header(&bs, NAL_REF_IDC_HIGH, NAL_PPS);
+    pps_rbsp(p_enc, &bs);
+    bitstream_end(&bs);
+
+    *header_buffer = (unsigned char *)bs.buffer;
+    return bs.bit_offset;
+}
+
+static int
+build_packed_seq_buffer(encoder_t *p_enc, unsigned char **header_buffer)
+{
+    bitstream bs;
+
+    bitstream_start(&bs);
+    nal_start_code_prefix(&bs);
+    nal_header(&bs, NAL_REF_IDC_HIGH, NAL_SPS);
+    sps_rbsp(p_enc, &bs);
+    bitstream_end(&bs);
+
+    *header_buffer = (unsigned char *)bs.buffer;
+    return bs.bit_offset;
+}
+
 block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
 {
 	encoder_sys_t *p_sys = p_enc->p_sys;
@@ -466,39 +766,31 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
 
 	va_status = vaSyncSurface(p_sys->va_dpy, p_sys->surface_id[SID_INPUT_PICTURE]);
 	CHECK_VASTATUS(va_status, "vaSyncSurface", 0);
-	
+
 	va_status = vaQuerySurfaceStatus(p_sys->va_dpy, p_sys->surface_id[SID_INPUT_PICTURE], &surface_status);
 	CHECK_VASTATUS(va_status, "vaQuerySurfaceStatus", 0);
 
 	va_status = vaMapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id, (void**)(&buf_list));
 	CHECK_VASTATUS(va_status, "vaMapBuffer", 0);
 
-	block_t *block = 0;
-	block_t *chain = 0;
+	block_t *block = block_Alloc(buf_list->size);;
 
-	while(buf_list != 0)
-	{
-		block = block_Alloc(buf_list->size);
-		block_ChainAppend(&chain, block);
+	memcpy(block->p_buffer, buf_list->buf, buf_list->size);
 
-		memcpy(block->p_buffer, buf_list->buf, buf_list->size);
 
-		buf_list = (VACodedBufferSegment*)buf_list->next;
-	}
-
-	chain->i_pts = date;
-	chain->i_dts = 0; ///TODO?!
-	chain->i_flags = (is_intra?BLOCK_FLAG_TYPE_I:BLOCK_FLAG_TYPE_P);
+	block->i_pts = date;
+	block->i_dts = 0; ///TODO?!
+	block->i_flags = (is_intra?BLOCK_FLAG_TYPE_I:BLOCK_FLAG_TYPE_P);
 
 	vaUnmapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id);
 
-	return chain;
+	return block;
 }
 
 int UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID surface_id)
 {
 	encoder_sys_t *p_sys = p_enc->p_sys;
-	
+
 	VAImage surface_image;
 	uint8_t *surface_p = 0;
 
@@ -507,14 +799,14 @@ int UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID surf
 
 	va_status = vaMapBuffer(p_sys->va_dpy, surface_image.buf, (void**)&surface_p);
 	CHECK_VASTATUS(va_status, "vaMapBuffer", 0);
-	
+
 	int i;
 	for(i = 0; i < p_pict->i_planes; i++)
 		memcpy(surface_p + surface_image.offsets[i], p_pict->p[i].p_pixels, p_pict->p[i].i_lines * p_pict->p[i].i_pitch);
 
 	vaUnmapBuffer(p_sys->va_dpy, surface_image.buf);
 	vaDestroyImage(p_sys->va_dpy, surface_image.image_id);
-	
+
 	return 1;
 }
 
@@ -523,7 +815,10 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 	VABufferID tempID;
 	VAStatus va_status;
 	VACodedBufferSegment *coded_buffer_segment = 0;
+	VABufferID va_buffers[10];
+    unsigned int num_va_buffers = 0;
 	int is_intra = 0;
+	int is_idr = 0;
 
 	encoder_sys_t *p_sys = p_enc->p_sys;
 
@@ -534,30 +829,64 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 	}
 	p_sys->intra_counter += 1;
 
-	va_status = vaBeginPicture(p_sys->va_dpy, p_sys->context_id, p_sys->surface_id[SID_INPUT_PICTURE]);
-	CHECK_VASTATUS(va_status, "vaBeginPicture", 0);
-
-	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->seq_param_buf_id), 1);
-	CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
-
 	if(!UploadPictureToSurface(p_enc, p_pict, p_sys->surface_id[SID_INPUT_PICTURE]))
 		return 0;
 
-	if(p_sys->pic_param_buf_id != VA_INVALID_ID)
-		vaDestroyBuffer(p_sys->va_dpy, p_sys->pic_param_buf_id);
-	p_sys->pic_param.ReferenceFrames[0].picture_id = p_sys->surface_id[SID_REFERENCE_PICTURE_1];
-	p_sys->pic_param.ReferenceFrames[1].picture_id = p_sys->surface_id[SID_REFERENCE_PICTURE_2];
-	p_sys->pic_param.ReferenceFrames[2].picture_id = VA_INVALID_ID;
-	p_sys->pic_param.CurrPic.picture_id = p_sys->surface_id[SID_RECON_PICTURE];
-	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncPictureParameterBufferType, sizeof(p_sys->pic_param), 1, &p_sys->pic_param, &p_sys->pic_param_buf_id);
-	CHECK_VASTATUS(va_status,"vaCreateBuffer", 0);
-	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &p_sys->pic_param_buf_id, 1);
-	CHECK_VASTATUS(va_status,"vaRenderPicture", 0);
+	if(p_sys->first_frame)
+	{
+		is_idr = 1;
 
-	va_status = vaMapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id, (void **)(&coded_buffer_segment));
-	CHECK_VASTATUS(va_status, "vaMapBuffer", 0);
-	memset(coded_buffer_segment->buf, 0, coded_buffer_segment->size);
-	vaUnmapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id);
+		VAEncPackedHeaderParameterBuffer packed_header_param_buffer;
+		unsigned int length_in_bits;
+        unsigned char *packed_seq_buffer = NULL, *packed_pic_buffer = NULL;
+		VAEncMiscParameterBuffer *misc_param;
+		VAEncMiscParameterHRD *misc_hrd_param;
+
+		length_in_bits = build_packed_seq_buffer(p_enc, &packed_seq_buffer);
+		packed_header_param_buffer.type = VAEncPackedHeaderSequence;
+		packed_header_param_buffer.bit_length = length_in_bits;
+		packed_header_param_buffer.has_emulation_bytes = 0;
+		va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncPackedHeaderParameterBufferType, sizeof(packed_header_param_buffer), 1, &packed_header_param_buffer, &p_sys->packed_seq_header_param_buf_id);
+		CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
+
+		va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncPackedHeaderDataBufferType, (length_in_bits + 7) / 8, 1, packed_seq_buffer, &p_sys->packed_seq_buf_id);
+        CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
+
+		length_in_bits = build_packed_pic_buffer(p_enc, &packed_pic_buffer);
+		packed_header_param_buffer.type = VAEncPackedHeaderPicture;
+        packed_header_param_buffer.bit_length = length_in_bits;
+        packed_header_param_buffer.has_emulation_bytes = 0;
+
+        va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncPackedHeaderParameterBufferType, sizeof(packed_header_param_buffer), 1, &packed_header_param_buffer, &p_sys->packed_pic_header_param_buf_id);
+        CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
+
+        va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncPackedHeaderDataBufferType, (length_in_bits + 7) / 8, 1, packed_pic_buffer, &p_sys->packed_pic_buf_id);
+        CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
+
+		vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncMiscParameterBufferType, sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl), 1, NULL,  &p_sys->misc_parameter_hrd_buf_id);
+		CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
+
+		vaMapBuffer(p_sys->va_dpy, p_sys->misc_parameter_hrd_buf_id, (void **)&misc_param);
+		misc_param->type = VAEncMiscParameterTypeHRD;
+		misc_hrd_param = (VAEncMiscParameterHRD *)misc_param->data;
+
+		if (p_sys->frame_bit_rate > 0)
+		{
+			misc_hrd_param->initial_buffer_fullness = p_sys->frame_bit_rate * 1024 * 4;
+			misc_hrd_param->buffer_size = p_sys->frame_bit_rate * 1024 * 8;
+		}
+		else
+		{
+			misc_hrd_param->initial_buffer_fullness = 0;
+			misc_hrd_param->buffer_size = 0;
+		}
+
+		vaUnmapBuffer(p_sys->va_dpy, p_sys->misc_parameter_hrd_buf_id);
+
+		free(packed_seq_buffer);
+		free(packed_pic_buffer);
+		p_sys->first_frame = 0;
+	}
 
 	p_sys->slice_param[0].slice_type = (is_intra?SLICE_TYPE_I:SLICE_TYPE_P);
 	p_sys->slice_param[0].num_macroblocks = p_sys->picture_height_in_mbs * p_sys->picture_width_in_mbs;
@@ -567,15 +896,62 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 		vaDestroyBuffer(p_sys->va_dpy, p_sys->slice_param_buf_id[0]);
 	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncSliceParameterBufferType, sizeof(p_sys->slice_param[0]), 1, &(p_sys->slice_param[0]), &(p_sys->slice_param_buf_id[0]));
 	CHECK_VASTATUS(va_status, "vaCreateBuffer", 0);
+
+	if(p_sys->pic_param_buf_id != VA_INVALID_ID)
+		vaDestroyBuffer(p_sys->va_dpy, p_sys->pic_param_buf_id);
+	p_sys->pic_param.ReferenceFrames[0].picture_id = p_sys->surface_id[SID_REFERENCE_PICTURE_1];
+	p_sys->pic_param.ReferenceFrames[1].picture_id = p_sys->surface_id[SID_REFERENCE_PICTURE_2];
+	p_sys->pic_param.ReferenceFrames[2].picture_id = VA_INVALID_ID;
+	p_sys->pic_param.CurrPic.picture_id = p_sys->surface_id[SID_RECON_PICTURE];
+	p_sys->pic_param.pic_fields.bits.idr_pic_flag = !!is_idr;
+	p_sys->pic_param.pic_fields.bits.reference_pic_flag = (p_sys->slice_param[0].slice_type != SLICE_TYPE_B);
+	va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncPictureParameterBufferType, sizeof(p_sys->pic_param), 1, &p_sys->pic_param, &p_sys->pic_param_buf_id);
+	CHECK_VASTATUS(va_status,"vaCreateBuffer", 0);
+
+	va_buffers[num_va_buffers++] = p_sys->seq_param_buf_id;
+	va_buffers[num_va_buffers++] = p_sys->pic_param_buf_id;
+
+	if (p_sys->packed_seq_header_param_buf_id != VA_INVALID_ID)
+		va_buffers[num_va_buffers++] = p_sys->packed_seq_header_param_buf_id;
+
+	if (p_sys->packed_seq_buf_id != VA_INVALID_ID)
+		va_buffers[num_va_buffers++] = p_sys->packed_seq_buf_id;
+
+	if (p_sys->packed_pic_header_param_buf_id != VA_INVALID_ID)
+		va_buffers[num_va_buffers++] = p_sys->packed_pic_header_param_buf_id;
+
+	if (p_sys->packed_pic_buf_id != VA_INVALID_ID)
+		va_buffers[num_va_buffers++] = p_sys->packed_pic_buf_id;
+
+	if (p_sys->packed_sei_header_param_buf_id != VA_INVALID_ID)
+		va_buffers[num_va_buffers++] = p_sys->packed_sei_header_param_buf_id;
+
+	if (p_sys->packed_sei_buf_id != VA_INVALID_ID)
+		va_buffers[num_va_buffers++] = p_sys->packed_sei_buf_id;
+
+	if (p_sys->misc_parameter_hrd_buf_id != VA_INVALID_ID)
+		va_buffers[num_va_buffers++] =  p_sys->misc_parameter_hrd_buf_id;
+
+	va_status = vaMapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id, (void **)(&coded_buffer_segment));
+	CHECK_VASTATUS(va_status, "vaMapBuffer", 0);
+	memset(coded_buffer_segment->buf, 0, coded_buffer_segment->size);
+	vaUnmapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id);
+
+	va_status = vaBeginPicture(p_sys->va_dpy, p_sys->context_id, p_sys->surface_id[SID_INPUT_PICTURE]);
+	CHECK_VASTATUS(va_status, "vaBeginPicture", 0);
+
+	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, va_buffers, num_va_buffers);
+	CHECK_VASTATUS(va_status, "vaRenderPicture", 0);
+
 	va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, &(p_sys->slice_param_buf_id[0]), 1);
 	CHECK_VASTATUS(va_status,"vaRenderPicture", 0);
+
+	va_status = vaEndPicture(p_sys->va_dpy , p_sys->context_id);
+	CHECK_VASTATUS(va_status, "vaEndPicture", 0);
 
 	tempID = p_sys->surface_id[SID_RECON_PICTURE];
 	p_sys->surface_id[SID_RECON_PICTURE] = p_sys->surface_id[SID_REFERENCE_PICTURE_1];
 	p_sys->surface_id[SID_REFERENCE_PICTURE_1] = tempID;
-
-	va_status = vaEndPicture(p_sys->va_dpy , p_sys->context_id);
-	CHECK_VASTATUS(va_status, "vaEndPicture", 0);
 
 	return GenCodedBlock(p_enc, is_intra, p_pict->date);
 }
