@@ -47,7 +47,7 @@
 #define NAL_IDR                 5
 #define NAL_SPS                 7
 #define NAL_PPS                 8
-#define NAL_SEI                    6
+#define NAL_SEI                 6
 
 #define SLICE_TYPE_P            0
 #define SLICE_TYPE_B            1
@@ -169,7 +169,7 @@ static int OpenEncoder( vlc_object_t *p_this )
         p_sys->picture_width_in_mbs = (p_sys->picture_width + 15) / 16;
         p_sys->picture_height_in_mbs = (p_sys->picture_height + 15) / 16;
         p_sys->qp_value = 28;
-        p_sys->frame_bit_rate = 0;
+        p_sys->frame_bit_rate = -1;
         p_sys->intra_rate = 30;
         p_sys->intra_counter = 0;
         p_sys->first_frame = 1;
@@ -264,10 +264,7 @@ static int OpenEncoder( vlc_object_t *p_this )
             p_sys->seq_param.seq_fields.bits.log2_max_frame_num_minus4 = 0;
             p_sys->seq_param.seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 = 2;
 
-            if(p_sys->frame_bit_rate > 0)
-                p_sys->seq_param.vui_parameters_present_flag = 1;
-            else
-                p_sys->seq_param.vui_parameters_present_flag = 0;
+            p_sys->seq_param.vui_parameters_present_flag = 1;
         }
 
         { // Initialize pic_param
@@ -649,42 +646,46 @@ static void sps_rbsp(encoder_t *p_enc, bitstream *bs)
         bitstream_put_ue(bs, seq_param->frame_crop_bottom_offset);      /* frame_crop_bottom_offset */
     }
 
-    if ( p_sys->frame_bit_rate < 0 ) {
-        bitstream_put_ui(bs, 0, 1); /* vui_parameters_present_flag */
-    } else {
-        bitstream_put_ui(bs, 1, 1); /* vui_parameters_present_flag */
-        bitstream_put_ui(bs, 0, 1); /* aspect_ratio_info_present_flag */
-        bitstream_put_ui(bs, 0, 1); /* overscan_info_present_flag */
-        bitstream_put_ui(bs, 0, 1); /* video_signal_type_present_flag */
-        bitstream_put_ui(bs, 0, 1); /* chroma_loc_info_present_flag */
-        bitstream_put_ui(bs, 1, 1); /* timing_info_present_flag */
-        {
-            bitstream_put_ui(bs, p_sys->seq_param.num_units_in_tick, 32);
-            bitstream_put_ui(bs, p_sys->seq_param.time_scale, 32);
-            bitstream_put_ui(bs, 1, 1);
-        }
-        bitstream_put_ui(bs, 1, 1); /* nal_hrd_parameters_present_flag */
-        {
-            // hrd_parameters
-            bitstream_put_ue(bs, 0);    /* cpb_cnt_minus1 */
-            bitstream_put_ui(bs, 4, 4); /* bit_rate_scale */
-            bitstream_put_ui(bs, 6, 4); /* cpb_size_scale */
 
-            bitstream_put_ue(bs, p_sys->frame_bit_rate - 1); /* bit_rate_value_minus1[0] */
-            bitstream_put_ue(bs, p_sys->frame_bit_rate*8 - 1); /* cpb_size_value_minus1[0] */
-            bitstream_put_ui(bs, 1, 1);  /* cbr_flag[0] */
-
-            bitstream_put_ui(bs, 23, 5);   /* initial_cpb_removal_delay_length_minus1 */
-            bitstream_put_ui(bs, 23, 5);   /* cpb_removal_delay_length_minus1 */
-            bitstream_put_ui(bs, 23, 5);   /* dpb_output_delay_length_minus1 */
-            bitstream_put_ui(bs, 23, 5);   /* time_offset_length  */
-        }
-        bitstream_put_ui(bs, 0, 1);   /* vcl_hrd_parameters_present_flag */
-        bitstream_put_ui(bs, 0, 1);   /* low_delay_hrd_flag */
-
-        bitstream_put_ui(bs, 0, 1); /* pic_struct_present_flag */
-        bitstream_put_ui(bs, 0, 1); /* bitstream_restriction_flag */
+    bitstream_put_ui(bs, 1, 1); /* vui_parameters_present_flag */
+    bitstream_put_ui(bs, 0, 1); /* aspect_ratio_info_present_flag */
+    bitstream_put_ui(bs, 0, 1); /* overscan_info_present_flag */
+    bitstream_put_ui(bs, 0, 1); /* video_signal_type_present_flag */
+    bitstream_put_ui(bs, 0, 1); /* chroma_loc_info_present_flag */
+    bitstream_put_ui(bs, 1, 1); /* timing_info_present_flag */
+    {
+        bitstream_put_ui(bs, seq_param->num_units_in_tick, 32);
+        bitstream_put_ui(bs, seq_param->time_scale, 32);
+        bitstream_put_ui(bs, 1, 1);
     }
+
+    if(p_sys->frame_bit_rate <= 0)
+    {
+        bitstream_put_ui(bs, 0, 1);/* nal_hrd_parameters_present_flag */
+    }
+    else
+    {
+        bitstream_put_ui(bs, 1, 1); /* nal_hrd_parameters_present_flag */
+
+        // hrd_parameters
+        bitstream_put_ue(bs, 0);    /* cpb_cnt_minus1 */
+        bitstream_put_ui(bs, 4, 4); /* bit_rate_scale */
+        bitstream_put_ui(bs, 6, 4); /* cpb_size_scale */
+
+        bitstream_put_ue(bs, p_sys->frame_bit_rate - 1); /* bit_rate_value_minus1[0] */
+        bitstream_put_ue(bs, p_sys->frame_bit_rate*8 - 1); /* cpb_size_value_minus1[0] */
+        bitstream_put_ui(bs, 1, 1);  /* cbr_flag[0] */
+
+        bitstream_put_ui(bs, 23, 5);   /* initial_cpb_removal_delay_length_minus1 */
+        bitstream_put_ui(bs, 23, 5);   /* cpb_removal_delay_length_minus1 */
+        bitstream_put_ui(bs, 23, 5);   /* dpb_output_delay_length_minus1 */
+        bitstream_put_ui(bs, 23, 5);   /* time_offset_length  */
+    }
+    bitstream_put_ui(bs, 0, 1);   /* vcl_hrd_parameters_present_flag */
+    bitstream_put_ui(bs, 0, 1);   /* low_delay_hrd_flag */
+
+    bitstream_put_ui(bs, 0, 1); /* pic_struct_present_flag */
+    bitstream_put_ui(bs, 0, 1); /* bitstream_restriction_flag */
 
     rbsp_trailing_bits(bs);     /* rbsp_trailing_bits */
 }
@@ -841,8 +842,6 @@ static int safe_destroy_buffers(encoder_t *p_enc, VABufferID *va_buffers, unsign
     return 1;
 }
 
-static int tfd = -1;
-
 block_t *GenCodedBlock(encoder_t *p_enc, int is_intra)
 {
     encoder_sys_t *p_sys = p_enc->p_sys;
@@ -870,19 +869,11 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra)
 
     memcpy(block->p_buffer, buf_list->buf, buf_list->size);
 
-    if(tfd < 0)
-        tfd = creat("/tmp/out.h264", 00644);
-    if(tfd >= 0)
-    {
-        int i = write(tfd, buf_list->buf, buf_list->size);
-        i++;
-    }
-
     block->i_length = INT64_C(1000000) * p_enc->fmt_in.video.i_frame_rate_base / p_enc->fmt_in.video.i_frame_rate;
     block->i_pts = p_sys->pts;
-    block->i_dts = p_sys->pts; //TODO?
+    block->i_dts = p_sys->pts; //FIXME/TODO?
     block->i_flags |= (is_intra?BLOCK_FLAG_TYPE_I:BLOCK_FLAG_TYPE_P);
-    
+
     p_sys->pts += block->i_length;
 
     vaUnmapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id);
@@ -915,7 +906,7 @@ int UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID surf
 
     for(int i = 0; i < p_pict->i_planes; i++)
     {
-        CopyPlane(surface_p + surface_image.offsets[i], surface_image.pitches[i], p_pict->p[i].p_pixels, p_pict->p[i].i_pitch, p_pict->p[i].i_pitch, p_pict->p[i].i_visible_lines);
+        CopyPlane(surface_p + surface_image.offsets[i], surface_image.pitches[i], p_pict->p[i].p_pixels, p_pict->p[i].i_pitch, p_pict->p[i].i_pitch, p_pict->p[i].i_lines);
     }
 
     vaUnmapBuffer(p_sys->va_dpy, surface_image.buf);
@@ -1006,7 +997,7 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
     }
 
     vaUnmapBuffer(p_sys->va_dpy, p_sys->misc_parameter_hrd_buf_id);
-    
+
     p_sys->slice_param[0].slice_type = (is_intra?SLICE_TYPE_I:SLICE_TYPE_P);
     p_sys->slice_param[0].num_macroblocks = p_sys->picture_height_in_mbs * p_sys->picture_width_in_mbs;
     p_sys->slice_param[0].slice_alpha_c0_offset_div2 = 2;
