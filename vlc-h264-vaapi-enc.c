@@ -177,23 +177,34 @@ static int OpenEncoder( vlc_object_t *p_this )
     p_sys->pic_stack_count = 0;
 
     { ///START INITIALIZE VARIABLES
-        p_sys->frame_bit_rate = -33; //p_enc->fmt_out.i_bitrate;
+        p_sys->frame_bit_rate = p_enc->fmt_out.i_bitrate;
 
         p_sys->intra_rate = p_enc->i_iframes;
         if(p_sys->intra_rate <= 0)
             p_sys->intra_rate = 25;
  
         if(p_sys->frame_bit_rate > 0)
+        {
             p_sys->qp_value = -1;
+            msg_Info(p_enc, "Using fixed bitrate %d", p_sys->frame_bit_rate);
+        }
         else if(p_sys->frame_bit_rate < 0)
         {
-            p_sys->qp_value = -1*p_sys->frame_bit_rate;
+            p_sys->qp_value = -1*p_sys->frame_bit_rate/1000;
             p_sys->frame_bit_rate = -1;
+            if(p_sys->qp_value > 51)
+            {
+                p_sys->qp_value = -2;
+                msg_Info(p_enc, "Using VBR");
+            }
+            else
+                msg_Info(p_enc, "Using dynamic qp %d", p_sys->qp_value);
         }
         else
         {
             p_sys->qp_value = 28;
             p_sys->frame_bit_rate = -1;
+            msg_Info(p_enc, "Using dynamic qp %d", p_sys->qp_value);
         }            
 
         p_sys->picture_width = p_enc->fmt_in.video.i_width;
@@ -269,7 +280,7 @@ static int OpenEncoder( vlc_object_t *p_this )
             p_sys->seq_param.seq_fields.bits.frame_mbs_only_flag = 1;
 
             if(p_sys->frame_bit_rate > 0)
-                p_sys->seq_param.bits_per_second = 1024 * p_sys->frame_bit_rate;
+                p_sys->seq_param.bits_per_second = p_sys->frame_bit_rate;
             else
                 p_sys->seq_param.bits_per_second = 0;
 
@@ -1124,8 +1135,8 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 
         if (p_sys->frame_bit_rate > 0)
         {
-            misc_hrd_param->initial_buffer_fullness = p_sys->frame_bit_rate * 1024 * 4;
-            misc_hrd_param->buffer_size = p_sys->frame_bit_rate * 1024 * 8;
+            misc_hrd_param->initial_buffer_fullness = p_sys->frame_bit_rate * 4;
+            misc_hrd_param->buffer_size = p_sys->frame_bit_rate * 8;
         }
         else
         {
