@@ -177,9 +177,12 @@ static int OpenEncoder( vlc_object_t *p_this )
     p_sys->pic_stack_count = 0;
 
     { ///START INITIALIZE VARIABLES
-        p_sys->qp_value = -1;
+        p_sys->qp_value = 28; ///TODO: Make this three configurable
         p_sys->frame_bit_rate = 3000;
         p_sys->intra_rate = 30;  
+ 
+        if(p_sys->frame_bit_rate > 0)
+            p_sys->qp_value = -1;
  
         p_sys->picture_width = p_enc->fmt_in.video.i_width;
         p_sys->picture_height = p_enc->fmt_in.video.i_height;
