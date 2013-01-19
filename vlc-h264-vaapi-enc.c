@@ -179,7 +179,10 @@ static int OpenEncoder( vlc_object_t *p_this )
     { ///START INITIALIZE VARIABLES
         p_sys->qp_value = 26; ///TODO: Make this three configurable
         p_sys->frame_bit_rate = 3000;
-        p_sys->intra_rate = 30;  
+
+        p_sys->intra_rate = p_enc->i_iframes;
+        if(p_sys->intra_rate <= 0)
+            p_sys->intra_rate = 25;
  
         if(p_sys->frame_bit_rate > 0)
             p_sys->qp_value = -1;
@@ -295,6 +298,8 @@ static int OpenEncoder( vlc_object_t *p_this )
 
 
             p_sys->seq_param.vui_parameters_present_flag = (p_sys->seq_param.time_scale > 0 || p_sys->frame_bit_rate > 0)?1:0;
+            if(p_sys->seq_param.time_scale > 0)
+                p_sys->seq_param.vui_fields.bits.timing_info_present_flag = 1;
         }
 
         { // Initialize pic_param
@@ -420,7 +425,7 @@ static int OpenEncoder( vlc_object_t *p_this )
         va_status = vaCreateConfig(p_sys->va_dpy, p_sys->profile, VAEntrypointEncSlice, &attrib[0], 2, &(p_sys->config_id));
         CHECK_VASTATUS(va_status, "vaCreateConfig", VLC_EGENERIC);
 
-        va_status = vaCreateContext(p_sys->va_dpy, p_sys->config_id, p_sys->picture_width, p_sys->picture_height, VA_PROGRESSIVE, 0, 0, &(p_sys->context_id));
+        va_status = vaCreateContext(p_sys->va_dpy, p_sys->config_id, p_sys->picture_width, p_sys->picture_height, /*VA_PROGRESSIVE*/ 0, 0, 0, &(p_sys->context_id));
         CHECK_VASTATUS(va_status, "vaCreateContext", VLC_EGENERIC);
     } /// DONE CREATING PIPE
 
@@ -482,6 +487,7 @@ static void CloseEncoder( vlc_object_t *p_this )
  * EncodeVideo: the whole thing
  ****************************************************************************/
 
+#define PREFETCH_NUM 10
 static void pic_stack_push(encoder_t *p_enc, picture_t *pic)
 {
     encoder_sys_t *p_sys = p_enc->p_sys;
@@ -691,7 +697,12 @@ static void sps_rbsp(encoder_t *p_enc, bitstream *bs)
     if (seq_param->seq_fields.bits.pic_order_cnt_type == 0)
         bitstream_put_ue(bs, seq_param->seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4);     /* log2_max_pic_order_cnt_lsb_minus4 */
     else {
-        assert(0);
+        bitstream_put_ui(bs, seq_param->seq_fields.bits.delta_pic_order_always_zero_flag, 1); /* delta_pic_order_always_zero_flag */
+        bitstream_put_se(bs, seq_param->offset_for_non_ref_pic); /* offset_for_non_ref_pic */
+        bitstream_put_se(bs, seq_param->offset_for_top_to_bottom_field);/* offset_for_top_to_bottom_field */
+        bitstream_put_ue(bs, seq_param->num_ref_frames_in_pic_order_cnt_cycle);/* num_ref_frames_in_pic_order_cnt_cycle */
+        for(int i = 0; i < seq_param->num_ref_frames_in_pic_order_cnt_cycle; ++i)
+            bitstream_put_se(bs, seq_param->offset_for_ref_frame[i]); /* offset_for_ref_frame[i] */
     }
 
     bitstream_put_ue(bs, seq_param->max_num_ref_frames);        /* num_ref_frames */
@@ -702,7 +713,7 @@ static void sps_rbsp(encoder_t *p_enc, bitstream *bs)
     bitstream_put_ui(bs, seq_param->seq_fields.bits.frame_mbs_only_flag, 1);    /* frame_mbs_only_flag */
 
     if (!seq_param->seq_fields.bits.frame_mbs_only_flag) {
-        assert(0);
+        bitstream_put_ui(bs, seq_param->seq_fields.bits.mb_adaptive_frame_field_flag, 1);
     }
 
     bitstream_put_ui(bs, seq_param->seq_fields.bits.direct_8x8_inference_flag, 1);      /* direct_8x8_inference_flag */
@@ -953,7 +964,10 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
 
     block->i_length = INT64_C(1000000) * p_sys->seq_param.num_units_in_tick / p_sys->seq_param.time_scale;
     block->i_pts = date;// - p_sys->initial_date;
-    block->i_dts = date;// - p_sys->initial_date;
+    if(block->i_length > 0)
+        block->i_dts = date - (2 * PREFETCH_NUM * block->i_length); 
+    else
+        block->i_dts = date;// - p_sys->initial_date;
 
     block->i_flags |= (is_intra?BLOCK_FLAG_TYPE_I:BLOCK_FLAG_TYPE_P);
 
@@ -1023,7 +1037,7 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
         picture_Hold(p_pict);
         pic_stack_push(p_enc, p_pict);
         
-        if(p_sys->pic_stack_count < 25)
+        if(p_sys->pic_stack_count < PREFETCH_NUM)
             return 0;
     }
 
@@ -1039,6 +1053,9 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
         if(!UploadPictureToSurface(p_enc, p_pict, p_sys->surface_id[SID_INPUT_PICTURE]))
             return 0;
         mtime_t date = p_pict->date;
+        bool progressive = p_pict->b_progressive;
+        //bool top_first = p_pict->b_top_field_first;
+        //unsigned int nb_fields = p_pict->i_nb_fields;
         picture_Release(p_pict);
         p_pict = 0;
 
@@ -1047,6 +1064,13 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
             is_idr = 1;
             p_sys->initial_date = date;
 
+            if(!progressive) // It seems like vaapi does not currently support interlaced encoding
+            {
+                msg_Info(p_enc, "Found interlaced stream");
+                //p_sys->seq_param.seq_fields.bits.frame_mbs_only_flag = 0;
+                //p_sys->seq_param.seq_fields.bits.mb_adaptive_frame_field_flag = 0;
+            }
+            
             VAEncPackedHeaderParameterBuffer packed_header_param_buffer;
             unsigned int length_in_bits;
             unsigned char *packed_seq_buffer = NULL, *packed_pic_buffer = NULL;
@@ -1074,6 +1098,7 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 
             free(packed_seq_buffer);
             free(packed_pic_buffer);
+
             p_sys->first_frame = 0;
         }
 
@@ -1120,6 +1145,7 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
         p_sys->pic_param.pic_fields.bits.idr_pic_flag = !!is_idr;
         p_sys->pic_param.pic_fields.bits.reference_pic_flag = (p_sys->slice_param[0].slice_type != SLICE_TYPE_B);
         p_sys->pic_param.frame_num = p_sys->intra_counter;
+        ///TODO/FIXME: set field_pic_flag to 1 if interlaced
         va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncPictureParameterBufferType, sizeof(p_sys->pic_param), 1, &p_sys->pic_param, &p_sys->pic_param_buf_id);
         CHECK_VASTATUS(va_status,"vaCreateBuffer", 0);
 
