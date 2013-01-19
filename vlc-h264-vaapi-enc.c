@@ -182,7 +182,7 @@ static int OpenEncoder( vlc_object_t *p_this )
         p_sys->intra_rate = p_enc->i_iframes;
         if(p_sys->intra_rate <= 0)
             p_sys->intra_rate = 25;
- 
+
         if(p_sys->frame_bit_rate > 0)
         {
             p_sys->qp_value = -1;
@@ -205,7 +205,7 @@ static int OpenEncoder( vlc_object_t *p_this )
             p_sys->qp_value = 28;
             p_sys->frame_bit_rate = -1;
             msg_Info(p_enc, "Using dynamic qp %d", p_sys->qp_value);
-        }            
+        }
 
         p_sys->picture_width = p_enc->fmt_in.video.i_width;
         p_sys->picture_height = p_enc->fmt_in.video.i_height;
@@ -272,7 +272,7 @@ static int OpenEncoder( vlc_object_t *p_this )
             int frame_crop_right_offset = 0;
 
             p_sys->seq_param.seq_parameter_set_id = 0;
-            p_sys->seq_param.level_idc = 41;
+            p_sys->seq_param.level_idc = 31;
             p_sys->seq_param.intra_period = p_sys->intra_rate;
             p_sys->seq_param.ip_period = 0;   /* FIXME: ??? */
             p_sys->seq_param.max_num_ref_frames = 4;
@@ -288,7 +288,7 @@ static int OpenEncoder( vlc_object_t *p_this )
             msg_Info(p_enc, "Using framerate of %d/%d", p_enc->fmt_in.video.i_frame_rate, p_enc->fmt_in.video.i_frame_rate_base);
             if(p_enc->fmt_in.video.i_frame_rate > 0 && p_enc->fmt_in.video.i_frame_rate_base > 0)
             {
-                p_sys->seq_param.time_scale = p_enc->fmt_in.video.i_frame_rate;
+                p_sys->seq_param.time_scale = p_enc->fmt_in.video.i_frame_rate*2;
                 p_sys->seq_param.num_units_in_tick = p_enc->fmt_in.video.i_frame_rate_base;
             }
             else
@@ -304,7 +304,7 @@ static int OpenEncoder( vlc_object_t *p_this )
                 frame_crop_bottom_offset =
                     (p_sys->picture_height_in_mbs * 16 - p_sys->picture_height) / (2 * (!p_sys->seq_param.seq_fields.bits.frame_mbs_only_flag + 1));
                 frame_crop_right_offset =
-                    (p_sys->picture_width_in_mbs  * 16 - p_sys->picture_width );
+                    (p_sys->picture_width_in_mbs  * 16 - p_sys->picture_width ) / 2;
             }
 
             p_sys->seq_param.frame_cropping_flag = frame_cropping_flag;
@@ -525,17 +525,17 @@ static void pic_stack_push(encoder_t *p_enc, picture_t *pic)
         cur_ptr = &cur->next;
         cur = cur->next;
     }
-    
+
     tmp->next = cur;
     *cur_ptr = tmp;
-    
+
     p_sys->pic_stack_count++;
 }
 
 static picture_t * pic_stack_pop(encoder_t *p_enc)
 {
     encoder_sys_t *p_sys = p_enc->p_sys;
-    
+
     if(p_sys->pic_stack_head == 0)
         return 0;
 
@@ -549,7 +549,7 @@ static picture_t * pic_stack_pop(encoder_t *p_enc)
 
     return res;
 }
- 
+
 #define BITSTREAM_ALLOCATE_STEPPING     4096
 
 struct __bitstream {
@@ -985,10 +985,10 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
 
     memcpy(block->p_buffer, buf_list->buf, buf_list->size);
 
-    block->i_length = INT64_C(1000000) * p_sys->seq_param.num_units_in_tick / p_sys->seq_param.time_scale;
+    block->i_length = INT64_C(1000000) * p_sys->seq_param.num_units_in_tick / p_sys->seq_param.time_scale/2;
     block->i_pts = date;// - p_sys->initial_date;
     if(block->i_length > 0)
-        block->i_dts = date - (2 * PREFETCH_NUM * block->i_length); 
+        block->i_dts = date - (2 * PREFETCH_NUM * block->i_length);
     else
         block->i_dts = date;// - p_sys->initial_date;
 
@@ -1059,7 +1059,7 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
     {
         picture_Hold(p_pict);
         pic_stack_push(p_enc, p_pict);
-        
+
         if(p_sys->pic_stack_count < PREFETCH_NUM)
             return 0;
     }
@@ -1093,11 +1093,11 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
                 p_sys->seq_param.seq_fields.bits.frame_mbs_only_flag = 0;
                 p_sys->seq_param.seq_fields.bits.mb_adaptive_frame_field_flag = 0;
                 if(p_sys->seq_param.frame_cropping_flag)
-                    p_sys->seq_param.frame_crop_bottom_offset = 
+                    p_sys->seq_param.frame_crop_bottom_offset =
                         (p_sys->picture_height_in_mbs * 16 - p_sys->picture_height) / (2 * (!p_sys->seq_param.seq_fields.bits.frame_mbs_only_flag + 1));
                 msg_Err(p_enc, "libva does not seem to support interlaced frames. VLC will most likely crash now");
             }
-            
+
             VAEncPackedHeaderParameterBuffer packed_header_param_buffer;
             unsigned int length_in_bits;
             unsigned char *packed_seq_buffer = NULL, *packed_pic_buffer = NULL;
