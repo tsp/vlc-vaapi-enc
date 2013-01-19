@@ -177,7 +177,7 @@ static int OpenEncoder( vlc_object_t *p_this )
     p_sys->pic_stack_count = 0;
 
     { ///START INITIALIZE VARIABLES
-        p_sys->qp_value = 28; ///TODO: Make this three configurable
+        p_sys->qp_value = 26; ///TODO: Make this three configurable
         p_sys->frame_bit_rate = 3000;
         p_sys->intra_rate = 30;  
  
@@ -261,6 +261,7 @@ static int OpenEncoder( vlc_object_t *p_this )
             else
                 p_sys->seq_param.bits_per_second = 0;
 
+            msg_Info(p_enc, "Using framerate of %d/%d", p_enc->fmt_in.video.i_frame_rate, p_enc->fmt_in.video.i_frame_rate_base);
             if(p_enc->fmt_in.video.i_frame_rate > 0 && p_enc->fmt_in.video.i_frame_rate_base > 0)
             {
                 p_sys->seq_param.time_scale = p_enc->fmt_in.video.i_frame_rate;
@@ -268,6 +269,7 @@ static int OpenEncoder( vlc_object_t *p_this )
             }
             else
             {
+                msg_Info(p_enc, "This seems VFR, trying to handle it");
                 p_sys->seq_param.time_scale = 0;
                 p_sys->seq_param.num_units_in_tick = 0;
             }
@@ -480,7 +482,7 @@ static void CloseEncoder( vlc_object_t *p_this )
  * EncodeVideo: the whole thing
  ****************************************************************************/
 
-static void pick_stack_push(encoder_t *p_enc, picture_t *pic)
+static void pic_stack_push(encoder_t *p_enc, picture_t *pic)
 {
     encoder_sys_t *p_sys = p_enc->p_sys;
 
@@ -501,7 +503,7 @@ static void pick_stack_push(encoder_t *p_enc, picture_t *pic)
     p_sys->pic_stack_count++;
 }
 
-static picture_t * pick_stack_pop(encoder_t *p_enc)
+static picture_t * pic_stack_pop(encoder_t *p_enc)
 {
     encoder_sys_t *p_sys = p_enc->p_sys;
     
@@ -949,16 +951,9 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
 
     memcpy(block->p_buffer, buf_list->buf, buf_list->size);
 
-    if(p_sys->seq_param.time_scale > 0 && p_sys->seq_param.num_units_in_tick > 0)
-    {
-        block->i_length = INT64_C(1000000) * p_sys->seq_param.num_units_in_tick / p_sys->seq_param.time_scale;
-        block->i_pts = p_sys->pts;
-        block->i_dts = p_sys->pts;
-    } else {
-        block->i_length = 0;
-        block->i_pts = date - p_sys->initial_date;
-        block->i_dts = date - p_sys->initial_date;
-    }
+    block->i_length = INT64_C(1000000) * p_sys->seq_param.num_units_in_tick / p_sys->seq_param.time_scale;
+    block->i_pts = date;// - p_sys->initial_date;
+    block->i_dts = date;// - p_sys->initial_date;
 
     block->i_flags |= (is_intra?BLOCK_FLAG_TYPE_I:BLOCK_FLAG_TYPE_P);
 
@@ -1026,7 +1021,7 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
     else
     {
         picture_Hold(p_pict);
-        pick_stack_push(p_enc, p_pict);
+        pic_stack_push(p_enc, p_pict);
         
         if(p_sys->pic_stack_count < 25)
             return 0;
@@ -1040,7 +1035,7 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
             is_intra = 1;
         }
 
-        picture_t *p_pict = pick_stack_pop(p_enc);
+        picture_t *p_pict = pic_stack_pop(p_enc);
         if(!UploadPictureToSurface(p_enc, p_pict, p_sys->surface_id[SID_INPUT_PICTURE]))
             return 0;
         mtime_t date = p_pict->date;
