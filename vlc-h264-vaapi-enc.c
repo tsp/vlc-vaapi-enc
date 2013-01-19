@@ -97,6 +97,7 @@ struct encoder_sys_t
     int drm_fd;
 
     mtime_t pts;
+    mtime_t initial_date;
 
     int picture_width;
     int picture_height;
@@ -176,8 +177,8 @@ static int OpenEncoder( vlc_object_t *p_this )
     p_sys->pic_stack_count = 0;
 
     { ///START INITIALIZE VARIABLES
-        p_sys->qp_value = 45;
-        p_sys->frame_bit_rate = -1;
+        p_sys->qp_value = -1;
+        p_sys->frame_bit_rate = 3000;
         p_sys->intra_rate = 30;  
  
         p_sys->picture_width = p_enc->fmt_in.video.i_width;
@@ -188,6 +189,7 @@ static int OpenEncoder( vlc_object_t *p_this )
         p_sys->intra_counter = 0;
         p_sys->first_frame = 1;
         p_sys->pts = 0;
+        p_sys->initial_date = -1;
 
         p_sys->profile = VAProfileH264High;
 
@@ -951,8 +953,8 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
         block->i_dts = p_sys->pts;
     } else {
         block->i_length = 0;
-        block->i_pts = date;
-        block->i_dts = date; //FIXME/TODO?
+        block->i_pts = date - p_sys->initial_date;
+        block->i_dts = date - p_sys->initial_date;
     }
 
     block->i_flags |= (is_intra?BLOCK_FLAG_TYPE_I:BLOCK_FLAG_TYPE_P);
@@ -1045,6 +1047,7 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
         if(p_sys->first_frame)
         {
             is_idr = 1;
+            p_sys->initial_date = date;
 
             VAEncPackedHeaderParameterBuffer packed_header_param_buffer;
             unsigned int length_in_bits;
