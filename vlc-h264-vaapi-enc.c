@@ -1084,11 +1084,12 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
             is_idr = 1;
             p_sys->initial_date = date;
 
-            if(!progressive) // It seems like vaapi does not currently support interlaced encoding
+            if(!progressive)
             {
                 msg_Info(p_enc, "Found interlaced stream");
-                //p_sys->seq_param.seq_fields.bits.frame_mbs_only_flag = 0;
-                //p_sys->seq_param.seq_fields.bits.mb_adaptive_frame_field_flag = 0;
+                p_sys->seq_param.seq_fields.bits.frame_mbs_only_flag = 0;
+                p_sys->seq_param.seq_fields.bits.mb_adaptive_frame_field_flag = 0;
+                msg_Err(p_enc, "libva does not seem to support interlaced frames. VLC will most likely crash now");
             }
             
             VAEncPackedHeaderParameterBuffer packed_header_param_buffer;
