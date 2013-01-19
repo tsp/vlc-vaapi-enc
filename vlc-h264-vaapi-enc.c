@@ -269,6 +269,7 @@ static int OpenEncoder( vlc_object_t *p_this )
         { // Initialize seq_param
             int frame_cropping_flag = 0;
             int frame_crop_bottom_offset = 0;
+            int frame_crop_right_offset = 0;
 
             p_sys->seq_param.seq_parameter_set_id = 0;
             p_sys->seq_param.level_idc = 41;
@@ -297,16 +298,18 @@ static int OpenEncoder( vlc_object_t *p_this )
                 p_sys->seq_param.num_units_in_tick = 0;
             }
 
-            if(p_sys->picture_height_in_mbs * 16 - p_sys->picture_height)
+            if((p_sys->picture_height_in_mbs * 16 - p_sys->picture_height) || (p_sys->picture_width_in_mbs * 16 - p_sys->picture_width))
             {
                 frame_cropping_flag = 1;
                 frame_crop_bottom_offset =
                     (p_sys->picture_height_in_mbs * 16 - p_sys->picture_height) / (2 * (!p_sys->seq_param.seq_fields.bits.frame_mbs_only_flag + 1));
+                frame_crop_right_offset =
+                    (p_sys->picture_width_in_mbs  * 16 - p_sys->picture_width );
             }
 
             p_sys->seq_param.frame_cropping_flag = frame_cropping_flag;
             p_sys->seq_param.frame_crop_left_offset = 0;
-            p_sys->seq_param.frame_crop_right_offset = 0;
+            p_sys->seq_param.frame_crop_right_offset = frame_crop_right_offset;
             p_sys->seq_param.frame_crop_top_offset = 0;
             p_sys->seq_param.frame_crop_bottom_offset = frame_crop_bottom_offset;
 
