@@ -2,7 +2,7 @@ PREFIX = /usr
 LD = ld
 CC = gcc
 INSTALL = install
-CFLAGS = -g -pipe -O2 -Wall -Wextra -pedantic
+CFLAGS = -g -pipe -O2 -Wall -Wextra 
 LDFLAGS =
 VLC_PLUGIN_CFLAGS := $(shell pkg-config --cflags vlc-plugin)
 VLC_PLUGIN_LIBS := $(shell pkg-config --libs vlc-plugin)
@@ -38,7 +38,7 @@ clean:
 
 mostlyclean: clean
 
-SOURCES = vlc-h264-vaapi-enc.c
+SOURCES = vlc-h264-vaapi-enc.c copy.c vaapi_common.c
 
 libh264-vaapi-enc_plugin.so: $(SOURCES:%.c=%.o)
 	$(CC) $(LDFLAGS) -shared -o $@ $^

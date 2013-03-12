@@ -20,6 +20,10 @@
  * Preamble
  *****************************************************************************/
 
+#ifdef HAVE_CONFIG_H
+# include "config.h"
+#endif
+
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_sout.h>
@@ -34,9 +38,14 @@
 #include <fcntl.h>
 
 #include <va/va.h>
-#include <va/va_x11.h>
-#include <va/va_drm.h>
 #include <va/va_enc_h264.h>
+
+#include "copy.h"
+#include "vaapi_common.h"
+
+#ifndef VLC_CODEC_VAAPI 
+#define VLC_CODEC_VAAPI VLC_FOURCC('V','A','P','I')
+#endif
 
 #define NAL_REF_IDC_NONE        0
 #define NAL_REF_IDC_LOW         1
@@ -64,7 +73,7 @@ static int OpenEncoder( vlc_object_t * );
 static void CloseEncoder( vlc_object_t * );
 
 vlc_module_begin ()
-    set_shortname( "h264-vaapi" )
+    set_shortname( "vaapienc" )
     set_description( "H264 VAAPI encoder" )
     set_capability( "encoder", 0 )
     set_callbacks( OpenEncoder, CloseEncoder )
@@ -76,28 +85,33 @@ vlc_module_end ()
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
+
+#if !VA_CHECK_VERSION(0,34,0)
+# error "Your VAAPI version is too old for encoding. You need at least 0.34.0"
+#endif
+
 static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict );
 
 struct picture_stack
 {
-    picture_t *pic;
+    int surf_idx;
+    mtime_t date;
+    int progressive;
+    vaapi_surface_t *vasurf;
     struct picture_stack *next;
 };
 
 #define MAX_SLICES                32
-#define SID_INPUT_PICTURE          0
-#define SID_REFERENCE_PICTURE_1    1
-#define SID_REFERENCE_PICTURE_2    2
-#define SID_RECON_PICTURE          3
-#define SID_NUMBER                              SID_RECON_PICTURE + 1
+
+#define PREFETCH_NUM 10
+#define SID_INPUT_PICTURE_0        0
+#define SID_REFERENCE_PICTURE_0    PREFETCH_NUM + 0
+#define SID_REFERENCE_PICTURE_1    PREFETCH_NUM + 1
+#define SID_RECON_PICTURE          PREFETCH_NUM + 2
+#define SID_NUMBER                 SID_RECON_PICTURE + 1
 struct encoder_sys_t
 {
     VADisplay va_dpy;
-    Display *x11_display;
-    int drm_fd;
-
-    mtime_t pts;
-    mtime_t initial_date;
 
     int picture_width;
     int picture_height;
@@ -108,6 +122,7 @@ struct encoder_sys_t
 
     uint64_t intra_counter;
     uint32_t intra_rate;
+    uint32_t idr_rate;
     uint32_t first_frame;
 
     VASurfaceID surface_id[SID_NUMBER];
@@ -130,10 +145,11 @@ struct encoder_sys_t
     VABufferID packed_sei_buf_id;
     VABufferID misc_parameter_hrd_buf_id;
 
+    vaapi_surface_t *cur_vasurf;
+
     int num_slices;
     int codedbuf_i_size;
     int codedbuf_pb_size;
-    int current_input_surface;
     int rate_control_method;
     int i_initial_cpb_removal_delay;
     int i_initial_cpb_removal_delay_length;
@@ -141,6 +157,9 @@ struct encoder_sys_t
     int i_cpb_removal_delay_length;
     int i_dpb_output_delay_length;
 
+    copy_cache_t image_cache;
+
+    uint8_t input_surf_used[PREFETCH_NUM];
     struct picture_stack *pic_stack_head;
     uint32_t pic_stack_count;
 };
@@ -153,7 +172,6 @@ static int OpenEncoder( vlc_object_t *p_this )
     VAEntrypoint entrypoints[5];
     VAStatus va_status;
     VAConfigAttrib attrib[2];
-    int major_ver, minor_ver;
     int num_entrypoints, slice_entrypoint;
     VAImage test_image;
     int i;
@@ -182,6 +200,7 @@ static int OpenEncoder( vlc_object_t *p_this )
         p_sys->intra_rate = p_enc->i_iframes;
         if(p_sys->intra_rate <= 0)
             p_sys->intra_rate = 25;
+        p_sys->idr_rate = 1;
 
         if(p_sys->frame_bit_rate > 0)
         {
@@ -207,6 +226,9 @@ static int OpenEncoder( vlc_object_t *p_this )
             msg_Info(p_enc, "Using dynamic qp %d", p_sys->qp_value);
         }
 
+        for(int i = 0; i < PREFETCH_NUM; ++i)
+            p_sys->input_surf_used[i] = 0;
+
         p_sys->picture_width = p_enc->fmt_in.video.i_width;
         p_sys->picture_height = p_enc->fmt_in.video.i_height;
         p_sys->picture_width_in_mbs = (p_sys->picture_width + 15) / 16;
@@ -214,8 +236,6 @@ static int OpenEncoder( vlc_object_t *p_this )
 
         p_sys->intra_counter = 0;
         p_sys->first_frame = 1;
-        p_sys->pts = 0;
-        p_sys->initial_date = -1;
 
         p_sys->profile = VAProfileH264High;
 
@@ -244,7 +264,6 @@ static int OpenEncoder( vlc_object_t *p_this )
         p_sys->misc_parameter_hrd_buf_id = VA_INVALID_ID;
         p_sys->codedbuf_i_size = p_sys->picture_width * p_sys->picture_height * 5;
         p_sys->codedbuf_pb_size = 0;
-        p_sys->current_input_surface = SID_INPUT_PICTURE;
         p_sys->packed_sei_header_param_buf_id = VA_INVALID_ID;
         p_sys->packed_sei_buf_id = VA_INVALID_ID;
         for (i = 0; i < MAX_SLICES; i++)
@@ -274,6 +293,7 @@ static int OpenEncoder( vlc_object_t *p_this )
             p_sys->seq_param.seq_parameter_set_id = 0;
             p_sys->seq_param.level_idc = 31;
             p_sys->seq_param.intra_period = p_sys->intra_rate;
+            p_sys->seq_param.intra_idr_period = p_sys->intra_rate * p_sys->idr_rate;
             p_sys->seq_param.ip_period = 0;   /* FIXME: ??? */
             p_sys->seq_param.max_num_ref_frames = 4;
             p_sys->seq_param.picture_width_in_mbs = p_sys->picture_width_in_mbs;
@@ -363,50 +383,9 @@ static int OpenEncoder( vlc_object_t *p_this )
         }
     } ///DONE INITIALIZE VARIABLES
 
-    { ///START OPEN DISPLAY
-        p_sys->x11_display = XOpenDisplay(0);
-        if(!p_sys->x11_display)
-        {
-            p_sys->drm_fd = open("/dev/dri/card0", O_RDWR);
-            if(p_sys->drm_fd < 0)
-            {
-                msg_Err(p_enc, "Could not open XDisplay and DRM device!");
-                free(p_sys);
-                return VLC_EGENERIC;
-            }
-        }
-        else
-        {
-            p_sys->drm_fd = -1;
-        }
-
-        if(p_sys->x11_display)
-        {
-            msg_Info(p_enc, "Using X11 VA Display");
-            p_sys->va_dpy = vaGetDisplay(p_sys->x11_display);
-        }
-        else if(p_sys->drm_fd >= 0)
-        {
-            msg_Info(p_enc, "Using DRM VA Display");
-            p_sys->va_dpy = vaGetDisplayDRM(p_sys->drm_fd);
-        }
-        else assert(0);
-
-        if(!p_sys->va_dpy)
-        {
-            msg_Err(p_enc, "Could not get a VAAPI device");
-            if(p_sys->x11_display)
-                XCloseDisplay(p_sys->x11_display);
-            if(p_sys->drm_fd >= 0)
-                close(p_sys->drm_fd);
-            free(p_sys);
-            return VLC_EGENERIC;
-        }
-    } ///DONE OPEN DISPLAY
-
     { /// START CREATE PIPE
-        va_status = vaInitialize(p_sys->va_dpy, &major_ver, &minor_ver);
-        CHECK_VASTATUS(va_status, "vaInitialize", VLC_EGENERIC);
+        if(!vaapi_open_display(p_enc, &p_sys->va_dpy))
+            return VLC_EGENERIC;
 
         vaQueryConfigEntrypoints(p_sys->va_dpy, p_sys->profile, entrypoints, &num_entrypoints);
 
@@ -416,11 +395,7 @@ static int OpenEncoder( vlc_object_t *p_this )
 
         if(slice_entrypoint == num_entrypoints)
         {
-            vaTerminate(p_sys->va_dpy);
-            if(p_sys->x11_display)
-                XCloseDisplay(p_sys->x11_display);
-            if(p_sys->drm_fd >= 0)
-                close(p_sys->drm_fd);
+            vaapi_close_display(p_sys->va_dpy);
             free(p_sys);
             msg_Err(p_enc, "System does not have h264 encoding support");
             return VLC_EGENERIC;
@@ -432,11 +407,7 @@ static int OpenEncoder( vlc_object_t *p_this )
 
         if((attrib[0].value & VA_RT_FORMAT_YUV420) == 0 || (attrib[1].value & p_sys->rate_control_method) == 0)
         {
-            vaTerminate(p_sys->va_dpy);
-            if(p_sys->x11_display)
-                XCloseDisplay(p_sys->x11_display);
-            if(p_sys->drm_fd >= 0)
-                close(p_sys->drm_fd);
+            vaapi_close_display(p_sys->va_dpy);
             free(p_sys);
             msg_Err(p_enc, "No YUV420 Format or no desired RC!");
             return VLC_EGENERIC;
@@ -465,21 +436,26 @@ static int OpenEncoder( vlc_object_t *p_this )
         CHECK_VASTATUS(va_status, "vaCreateBuffer", VLC_EGENERIC);
 
         p_sys->pic_param.coded_buf = p_sys->codedbuf_buf_id;
+
+        CopyInitCache(&p_sys->image_cache, p_sys->picture_width_in_mbs * 16);
     } /// DONE ALLOC RESOURCES
 
     { /// START PROBE IMAGE FORMAT
-        va_status = vaDeriveImage(p_sys->va_dpy, p_sys->surface_id[SID_INPUT_PICTURE], &test_image);
-        CHECK_VASTATUS(va_status, "vaDeriveImage", false);
+        if( p_enc->fmt_in.i_codec != VLC_CODEC_VAAPI )
+        {
+            va_status = vaDeriveImage(p_sys->va_dpy, p_sys->surface_id[SID_INPUT_PICTURE_0], &test_image);
+            CHECK_VASTATUS(va_status, "vaDeriveImage", false);
 
-        p_enc->fmt_in.i_codec = test_image.format.fourcc;
+            p_enc->fmt_in.i_codec = test_image.format.fourcc;
+
+            va_status = vaDestroyImage(p_sys->va_dpy, test_image.image_id);
+            CHECK_VASTATUS(va_status, "vaDestroyImage", false);
+        }
 
         char str[5];
         str[4] = 0;
         vlc_fourcc_to_char(p_enc->fmt_in.i_codec, str);
         msg_Info(p_enc, "Negotiated to fourcc format \"%s\"", str);
-
-        va_status = vaDestroyImage(p_sys->va_dpy, test_image.image_id);
-        CHECK_VASTATUS(va_status, "vaDestroyImage", false);
     } /// DONE PROBE IMAGE FORMAT
 
     return VLC_SUCCESS;
@@ -494,61 +470,19 @@ static void CloseEncoder( vlc_object_t *p_this )
     encoder_t *p_enc = (encoder_t *)p_this;
     encoder_sys_t *p_sys = p_enc->p_sys;
 
+    CopyCleanCache(&p_sys->image_cache);
+
     vaDestroyBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id);
     vaDestroySurfaces(p_sys->va_dpy, &(p_sys->surface_id[0]), SID_NUMBER);
     vaDestroyContext(p_sys->va_dpy, p_sys->context_id);
     vaDestroyConfig(p_sys->va_dpy, p_sys->config_id);
-    vaTerminate(p_sys->va_dpy);
-    if(p_sys->x11_display)
-        XCloseDisplay(p_sys->x11_display);
-    if(p_sys->drm_fd >= 0)
-        close(p_sys->drm_fd);
+    vaapi_close_display(p_sys->va_dpy);
     free(p_sys);
 }
 
 /****************************************************************************
  * EncodeVideo: the whole thing
  ****************************************************************************/
-
-#define PREFETCH_NUM 10
-static void pic_stack_push(encoder_t *p_enc, picture_t *pic)
-{
-    encoder_sys_t *p_sys = p_enc->p_sys;
-
-    struct picture_stack *tmp = (struct picture_stack *)malloc(sizeof(struct picture_stack));
-    tmp->pic = pic;
-
-    struct picture_stack *cur = p_sys->pic_stack_head;
-    struct picture_stack **cur_ptr = &p_sys->pic_stack_head;
-    while(cur != 0 && pic->date > cur->pic->date)
-    {
-        cur_ptr = &cur->next;
-        cur = cur->next;
-    }
-
-    tmp->next = cur;
-    *cur_ptr = tmp;
-
-    p_sys->pic_stack_count++;
-}
-
-static picture_t * pic_stack_pop(encoder_t *p_enc)
-{
-    encoder_sys_t *p_sys = p_enc->p_sys;
-
-    if(p_sys->pic_stack_head == 0)
-        return 0;
-
-    picture_t *res = p_sys->pic_stack_head->pic;
-
-    struct picture_stack *tmp = p_sys->pic_stack_head;
-    p_sys->pic_stack_head = p_sys->pic_stack_head->next;
-    free(tmp);
-
-    p_sys->pic_stack_count--;
-
-    return res;
-}
 
 #define BITSTREAM_ALLOCATE_STEPPING     4096
 
@@ -958,7 +892,7 @@ static int safe_destroy_buffers(encoder_t *p_enc, VABufferID *va_buffers, unsign
     return 1;
 }
 
-block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
+static block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date, VASurfaceID inputSurf)
 {
     encoder_sys_t *p_sys = p_enc->p_sys;
 
@@ -966,10 +900,10 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
     VAStatus va_status;
     VASurfaceStatus surface_status = 0;
 
-    va_status = vaSyncSurface(p_sys->va_dpy, p_sys->surface_id[SID_INPUT_PICTURE]);
+    va_status = vaSyncSurface(p_sys->va_dpy, inputSurf);
     CHECK_VASTATUS(va_status, "vaSyncSurface", 0);
 
-    va_status = vaQuerySurfaceStatus(p_sys->va_dpy, p_sys->surface_id[SID_INPUT_PICTURE], &surface_status);
+    va_status = vaQuerySurfaceStatus(p_sys->va_dpy, inputSurf, &surface_status);
     CHECK_VASTATUS(va_status, "vaQuerySurfaceStatus", 0);
 
     va_status = vaMapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id, (void**)(&buf_list));
@@ -986,32 +920,36 @@ block_t *GenCodedBlock(encoder_t *p_enc, int is_intra, mtime_t date)
     memcpy(block->p_buffer, buf_list->buf, buf_list->size);
 
     block->i_length = INT64_C(1000000) * p_sys->seq_param.num_units_in_tick / p_sys->seq_param.time_scale/2;
-    block->i_pts = date;// - p_sys->initial_date;
+    block->i_pts = date;
     if(block->i_length > 0)
         block->i_dts = date - (2 * PREFETCH_NUM * block->i_length);
     else
-        block->i_dts = date;// - p_sys->initial_date;
+        block->i_dts = date;
 
     block->i_flags |= (is_intra?BLOCK_FLAG_TYPE_I:BLOCK_FLAG_TYPE_P);
-
-    p_sys->pts += block->i_length;
 
     vaUnmapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id);
 
     return block;
 }
 
-void CopyPlane(uint8_t *dst, size_t dst_pitch, const uint8_t *src, size_t src_pitch, uint32_t width, uint32_t height)
+/*static void MyCopyPlane(uint8_t *dst, size_t dst_pitch,
+                      const uint8_t *src, size_t src_pitch,
+                      unsigned width, unsigned height)
 {
-    for(uint32_t y = 0; y < height; y++)
-    {
+    for (unsigned y = 0; y < height; y++) {
+        for(unsigned x = 0; x < width; x++)
+        {
+            uint8_t tmp = src[x];
+            dst[x] = tmp;
+        }
         memcpy(dst, src, width);
         src += src_pitch;
         dst += dst_pitch;
     }
-}
+}*/
 
-int UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID surface_id)
+static int UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID surface_id)
 {
     encoder_sys_t *p_sys = p_enc->p_sys;
 
@@ -1024,15 +962,99 @@ int UploadPictureToSurface(encoder_t *p_enc, picture_t *p_pict, VASurfaceID surf
     va_status = vaMapBuffer(p_sys->va_dpy, surface_image.buf, (void**)&surface_p);
     CHECK_VASTATUS(va_status, "vaMapBuffer", 0);
 
+    memset(surface_p, 0, surface_image.data_size);
+
     for(int i = 0; i < p_pict->i_planes; i++)
     {
-        CopyPlane(surface_p + surface_image.offsets[i], surface_image.pitches[i], p_pict->p[i].p_pixels, p_pict->p[i].i_pitch, p_pict->p[i].i_pitch, p_pict->p[i].i_lines);
+        int line_offset = 0;//(i==0)?2:1; // Workaround: Don't copy first line, as it seems to be broken very often. TODO: Find out why!
+        int dst_pitch_offset = line_offset * surface_image.pitches[i];
+        int src_pitch_offset = line_offset * p_pict->p[i].i_pitch;
+
+        FastCopyPlane(surface_p + surface_image.offsets[i] + dst_pitch_offset, surface_image.pitches[i],
+                      p_pict->p[i].p_pixels + src_pitch_offset, p_pict->p[i].i_pitch,
+                      p_pict->p[i].i_pitch, p_pict->p[i].i_lines - line_offset,
+                      &p_sys->image_cache);
+        /*MyCopyPlane(surface_p + surface_image.offsets[i], surface_image.pitches[i],
+                    p_pict->p[i].p_pixels, p_pict->p[i].i_pitch,
+                    p_pict->p[i].i_pitch, p_pict->p[i].i_lines);*/
     }
 
     vaUnmapBuffer(p_sys->va_dpy, surface_image.buf);
     vaDestroyImage(p_sys->va_dpy, surface_image.image_id);
 
     return 1;
+}
+
+static void pic_stack_push(encoder_t *p_enc, picture_t *pic)
+{
+    encoder_sys_t *p_sys = p_enc->p_sys;
+
+    struct picture_stack *tmp = (struct picture_stack *)calloc(1, sizeof(struct picture_stack));
+
+    int use;
+    for(use = 0; use < PREFETCH_NUM && p_sys->input_surf_used[use]; ++use);
+    assert(use < PREFETCH_NUM);
+
+    tmp->date = pic->date;
+    tmp->surf_idx = use;
+    tmp->progressive = (pic->b_progressive)?1:0;
+    tmp->vasurf = NULL;
+    p_sys->input_surf_used[use] = 1;
+
+    if(pic->format.i_chroma != VLC_CODEC_VAAPI)
+    {
+        int res = UploadPictureToSurface(p_enc, pic, p_sys->surface_id[SID_INPUT_PICTURE_0 + use]);
+        if(!res)
+        {
+            assert(0);
+        }
+    }
+    else
+    {
+        tmp->vasurf = ((vaapi_surface_t**)pic->p[0].p_pixels)[0];
+        assert(tmp->vasurf != NULL);
+    }
+
+    struct picture_stack *cur = p_sys->pic_stack_head;
+    struct picture_stack **cur_ptr = &p_sys->pic_stack_head;
+    while(cur != 0 && tmp->date > cur->date)
+    {
+        cur_ptr = &cur->next;
+        cur = cur->next;
+    }
+
+    tmp->next = cur;
+    *cur_ptr = tmp;
+
+    p_sys->pic_stack_count++;
+}
+
+static VASurfaceID pic_stack_pop(encoder_t *p_enc, mtime_t *date, int *progressive)
+{
+    encoder_sys_t *p_sys = p_enc->p_sys;
+
+    if(p_sys->pic_stack_head == 0)
+        return VA_INVALID_ID;
+
+    int res = p_sys->pic_stack_head->surf_idx;
+    if(date)
+        *date = p_sys->pic_stack_head->date;
+    if(progressive)
+        *progressive = p_sys->pic_stack_head->progressive;
+
+    struct picture_stack *tmp = p_sys->pic_stack_head;
+    p_sys->pic_stack_head = p_sys->pic_stack_head->next;
+    p_sys->cur_vasurf = tmp->vasurf;
+    free(tmp);
+
+    p_sys->pic_stack_count--;
+
+    p_sys->input_surf_used[res] = 0;
+
+    if(!p_sys->cur_vasurf)
+        return p_sys->surface_id[SID_INPUT_PICTURE_0 + res];
+    else
+        return p_sys->cur_vasurf->id;
 }
 
 static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
@@ -1057,7 +1079,6 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
     }
     else
     {
-        picture_Hold(p_pict);
         pic_stack_push(p_enc, p_pict);
 
         if(p_sys->pic_stack_count < PREFETCH_NUM)
@@ -1067,25 +1088,33 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
     block_t *chain = 0;
     for(int kk = 0; kk < pop_count; ++kk)
     {
-        if(p_sys->intra_counter % p_sys->intra_rate == 0)
+        if(p_sys->idr_rate > 0 && p_sys->intra_counter % (p_sys->intra_rate * p_sys->idr_rate) == 0)
         {
             is_intra = 1;
+            is_idr = 1;
+        }
+        else if(p_sys->intra_counter % p_sys->intra_rate == 0)
+        {
+            is_intra = 1;
+            is_idr = 0;
+        }
+        else
+        {
+            is_intra = 0;
+            is_idr = 0;
         }
 
-        picture_t *p_pict = pic_stack_pop(p_enc);
-        if(!UploadPictureToSurface(p_enc, p_pict, p_sys->surface_id[SID_INPUT_PICTURE]))
-            return 0;
-        mtime_t date = p_pict->date;
-        bool progressive = p_pict->b_progressive;
-        //bool top_first = p_pict->b_top_field_first;
-        //unsigned int nb_fields = p_pict->i_nb_fields;
-        picture_Release(p_pict);
-        p_pict = 0;
+        mtime_t date = -1;
+        int progressive = -1;
+        VASurfaceID inputSurf = pic_stack_pop(p_enc, &date, &progressive);
+        assert(inputSurf != VA_INVALID_ID && progressive != -1 && date != -1);
 
         if(p_sys->first_frame)
         {
             is_idr = 1;
-            p_sys->initial_date = date;
+            is_intra = 1;
+            p_sys->first_frame = 0;
+
 
             if(!progressive)
             {
@@ -1097,10 +1126,15 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
                         (p_sys->picture_height_in_mbs * 16 - p_sys->picture_height) / (2 * (!p_sys->seq_param.seq_fields.bits.frame_mbs_only_flag + 1));
                 msg_Err(p_enc, "libva does not seem to support interlaced frames. VLC will most likely crash now");
             }
+        }
 
+        if(is_idr)
+        {
             VAEncPackedHeaderParameterBuffer packed_header_param_buffer;
             unsigned int length_in_bits;
             unsigned char *packed_seq_buffer = NULL, *packed_pic_buffer = NULL;
+
+            p_sys->intra_counter = 0;
 
             length_in_bits = build_packed_seq_buffer(p_enc, &packed_seq_buffer);
             packed_header_param_buffer.type = VAEncPackedHeaderSequence;
@@ -1125,8 +1159,6 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 
             free(packed_seq_buffer);
             free(packed_pic_buffer);
-
-            p_sys->first_frame = 0;
         }
 
         va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncSequenceParameterBufferType, sizeof(p_sys->seq_param), 1, &(p_sys->seq_param), &(p_sys->seq_param_buf_id));
@@ -1157,6 +1189,21 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
         p_sys->slice_param[0].num_macroblocks = p_sys->picture_height_in_mbs * p_sys->picture_width_in_mbs;
         p_sys->slice_param[0].slice_alpha_c0_offset_div2 = 2;
         p_sys->slice_param[0].slice_beta_offset_div2 = 2;
+        /*if((p_sys->intra_counter + 1) % (p_sys->intra_rate * p_sys->idr_rate) == 0)
+        {
+            p_sys->slice_param[0].flags.bits.adaptive_ref_pic_marking_mode_flag = 1;
+            p_sys->slice_param[0].MMCOps[0].opcode = MMCO_SHORT2UNUSED;
+            p_sys->slice_param[0].MMCOps[0].short_pic_num = 3;
+            p_sys->slice_param[0].MMCOps[1].opcode = MMCO_SHORT2UNUSED;
+            p_sys->slice_param[0].MMCOps[1].short_pic_num = 2;
+            p_sys->slice_param[0].MMCOps[2].opcode = MMCO_SHORT2UNUSED;
+            p_sys->slice_param[0].MMCOps[2].short_pic_num = 1;
+            p_sys->slice_param[0].MMCOps[3].opcode = MMCO_END;
+        }
+        else
+        {
+            p_sys->slice_param[0].flags.bits.adaptive_ref_pic_marking_mode_flag = 0;
+        }*/
         if(p_sys->slice_param_buf_id[0] != VA_INVALID_ID)
             vaDestroyBuffer(p_sys->va_dpy, p_sys->slice_param_buf_id[0]);
         va_status = vaCreateBuffer(p_sys->va_dpy, p_sys->context_id, VAEncSliceParameterBufferType, sizeof(p_sys->slice_param[0]), 1, &(p_sys->slice_param[0]), &(p_sys->slice_param_buf_id[0]));
@@ -1164,8 +1211,8 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 
         if(p_sys->pic_param_buf_id != VA_INVALID_ID)
             vaDestroyBuffer(p_sys->va_dpy, p_sys->pic_param_buf_id);
-        p_sys->pic_param.ReferenceFrames[0].picture_id = p_sys->surface_id[SID_REFERENCE_PICTURE_1];
-        p_sys->pic_param.ReferenceFrames[1].picture_id = p_sys->surface_id[SID_REFERENCE_PICTURE_2];
+        p_sys->pic_param.ReferenceFrames[0].picture_id = p_sys->surface_id[SID_REFERENCE_PICTURE_0];
+        p_sys->pic_param.ReferenceFrames[1].picture_id = p_sys->surface_id[SID_REFERENCE_PICTURE_1];
         p_sys->pic_param.ReferenceFrames[2].picture_id = VA_INVALID_ID;
         p_sys->pic_param.CurrPic.picture_id = p_sys->surface_id[SID_RECON_PICTURE];
         p_sys->pic_param.CurrPic.TopFieldOrderCnt = p_sys->intra_counter * 2;
@@ -1226,7 +1273,7 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
         memset(coded_buffer_segment->buf, 0, coded_buffer_segment->size);
         vaUnmapBuffer(p_sys->va_dpy, p_sys->codedbuf_buf_id);
 
-        va_status = vaBeginPicture(p_sys->va_dpy, p_sys->context_id, p_sys->surface_id[SID_INPUT_PICTURE]);
+        va_status = vaBeginPicture(p_sys->va_dpy, p_sys->context_id, inputSurf);
         CHECK_VASTATUS(va_status, "vaBeginPicture", 0);
 
         va_status = vaRenderPicture(p_sys->va_dpy, p_sys->context_id, va_buffers, num_va_buffers);
@@ -1239,10 +1286,17 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
         CHECK_VASTATUS(va_status, "vaEndPicture", 0);
 
         tempID = p_sys->surface_id[SID_RECON_PICTURE];
-        p_sys->surface_id[SID_RECON_PICTURE] = p_sys->surface_id[SID_REFERENCE_PICTURE_1];
-        p_sys->surface_id[SID_REFERENCE_PICTURE_1] = tempID;
+        p_sys->surface_id[SID_RECON_PICTURE] = p_sys->surface_id[SID_REFERENCE_PICTURE_0];
+        p_sys->surface_id[SID_REFERENCE_PICTURE_0] = tempID;
 
-        block_t *res = GenCodedBlock(p_enc, is_intra, date);
+        block_t *res = GenCodedBlock(p_enc, is_intra, date, inputSurf);
+
+        if(p_sys->cur_vasurf)
+        {
+            vaapi_surface_manage_release_surface(p_sys->cur_vasurf);
+            free(p_sys->cur_vasurf);
+            p_sys->cur_vasurf = NULL;
+        }
 
         safe_destroy_buffers(p_enc, &p_sys->seq_param_buf_id, 1);
         safe_destroy_buffers(p_enc, &p_sys->packed_seq_header_param_buf_id, 1);
@@ -1260,3 +1314,4 @@ static block_t *EncodeVideo(encoder_t *p_enc, picture_t *p_pict)
 
     return chain;
 }
+
