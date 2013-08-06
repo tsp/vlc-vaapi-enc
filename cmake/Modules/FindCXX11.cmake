@@ -8,7 +8,8 @@
 #
 # TODO: When compilers starts implementing the whole C++11, check the full set
 
-if(CXX11_FOUND)
+if(CXX11_FLAGS)
+    set(CXX11_FOUND true)
     return()
 endif()
 
@@ -68,3 +69,4 @@ set(CXX11_FLAGS "${CXX11_FLAGS_INTERNAL}")
 find_package_handle_standard_args(CXX11 DEFAULT_MSG CXX11_FLAGS)
 mark_as_advanced(CXX11_FLAGS)
 
+set(CXX11_FLAGS ${CXX11_FLAGS} CACHE STRING "C++11 Flags")
