@@ -26,11 +26,6 @@ static int OpenEncoder(vlc_object_t *p_this)
     encoder_t *p_enc = (encoder_t*)p_this;
     encoder_sys_t *p_sys;
 
-    if(p_enc->fmt_out.i_codec != VLC_CODEC_H264 && !p_enc->b_force)
-        return VLC_EGENERIC;
-
-    p_enc->fmt_out.i_cat = VIDEO_ES;
-    p_enc->fmt_out.i_codec = VLC_CODEC_H264;
     p_enc->p_sys = p_sys = (encoder_sys_t*)calloc(1, sizeof(encoder_sys_t));
     if(!p_sys)
         return VLC_ENOMEM;
@@ -40,11 +35,21 @@ static int OpenEncoder(vlc_object_t *p_this)
     p_enc->pf_encode_video = EncodeVideo;
 
     p_sys->enc = new VaEncoder(p_enc);
+    if(!p_sys->enc)
+    {
+        free(p_sys);
+        return VLC_ENOMEM;
+    }
 
     if(p_sys->enc->initialize())
+    {
         return VLC_SUCCESS;
+    }
     else
+    {
+        CloseEncoder(p_this);
         return VLC_EGENERIC;
+    }
 }
 
 static void CloseEncoder(vlc_object_t *p_this)
