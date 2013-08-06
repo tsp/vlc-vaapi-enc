@@ -17,7 +17,7 @@ find_package(Libva REQUIRED X11 DRM)
 find_package(VlcPlugin REQUIRED)
 find_package(CXX11 REQUIRED)
 
-set(CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS} ${CXX11_FLAGS})
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX11_FLAGS}")
 set(CMAKE_C_FLAGS ${CMAKE_C_FLAGS} -std=gnu99)
 add_definitions(${Libva_DEFINITIONS} ${VlcPlugin_DEFINITIONS})
 include_directories(${Libva_INCLUDE_DIRS} ${VlcPlugin_INCLUDE_DIRS} src)
