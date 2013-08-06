@@ -8,6 +8,10 @@
 #
 # TODO: When compilers starts implementing the whole C++11, check the full set
 
+if(CXX11_FOUND)
+    return()
+endif()
+
 include(CheckCXXSourceCompiles)
 include(FindPackageHandleStandardArgs)
 

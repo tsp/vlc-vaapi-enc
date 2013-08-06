@@ -8,9 +8,13 @@
 
 include(LibFindMacros)
 
+if(NOT VlcPlugin_MODULE_STRING)
+    message(FATAL_ERROR "You need to set VlcPlugin_MODULE_STRING to build a vlc plugin!")
+endif()
+
 libfind_pkg_check_modules(VlcPlugin_PKGCONF vlc-plugin)
 
-set(VlcPlugin_DEFINITIONS ${VlcPlugin_PKGCONF_CFLAGS_OTHER})
+set(VlcPlugin_DEFINITIONS ${VlcPlugin_PKGCONF_CFLAGS_OTHER} -DMODULE_STRING=\"${VlcPlugin_MODULE_STRING}\")
 find_path(VlcPlugin_INCLUDE_DIR NAMES vlc_plugin.h PATHS ${VlcPlugin_PKGCONF_INCLUDE_DIRS})
 find_library(VlcPlugin_LIBRARY NAMES vlccore PATHS ${VlcPlugin_PKGCONF_LIBRARY_DIRS})
 

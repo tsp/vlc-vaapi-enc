@@ -11,6 +11,8 @@ set(vlc-vaapi-enc_HEADERS
     src/encoder.h
     src/copy.h)
 
+set(VlcPlugin_MODULE_STRING vaapi-enc)
+
 find_package(Libva REQUIRED X11 DRM)
 find_package(VlcPlugin REQUIRED)
 find_package(CXX11 REQUIRED)
@@ -20,9 +22,7 @@ set(CMAKE_C_FLAGS ${CMAKE_C_FLAGS} -std=gnu99)
 add_definitions(${Libva_DEFINITIONS} ${VlcPlugin_DEFINITIONS})
 include_directories(${Libva_INCLUDE_DIRS} ${VlcPlugin_INCLUDE_DIRS} src)
 
-add_definitions(-DMODULE_STRING=\"h264-vaapi-enc\")
+add_library(vaapi_enc_plugin SHARED ${vlc-vaapi-enc_SOURCES} ${vlc-vaapi-enc_HEADERS})
+target_link_libraries(vaapi_enc_plugin ${Libva_LIBRARIES} ${VlcPlugin_LIBRARIES})
 
-add_library(vlc-vaapi-enc ${vlc-vaapi-enc_SOURCES} ${vlc-vaapi-enc_HEADERS})
-target_link_libraries(vlc-vaapi-enc ${Libva_LIBRARIES} ${VlcPlugin_LIBRARIES})
-
-install_targets(/usr/lib/vlc/plugins/codec vlc-vaapi-enc)
+install_targets(/lib/vlc/plugins/codec vaapi_enc_plugin)
